@@ -27,6 +27,7 @@ pub struct CoreOptions {
     pub log: LogFn,
     pub tap: Option<Tap>,
     pub claims: Option<Arc<nfsu2_claims::Claims>>,
+    pub deny: Option<Arc<nfsu2_names::Deny>>,
     pub clocks: Rc<Clocks>,
     pub limits: Limits,
     pub buddy_limits: BuddyLimits,
@@ -46,6 +47,8 @@ pub struct Core {
     pub cause: Option<Arc<dyn Charge>>,
     /// the claimed names (OnlineOptions::claims)
     pub claims: Option<Arc<nfsu2_claims::Claims>>,
+    /// the names taken away (OnlineOptions::deny)
+    pub deny: Option<Arc<nfsu2_names::Deny>>,
     /// the browsers that spoke to this host and are still on the switch
     here: HashSet<u32>,
     pub timers: Timers,
@@ -81,6 +84,7 @@ impl Core {
             races_read: false,
             cause: None,
             claims: o.claims.clone(),
+            deny: o.deny,
             here: HashSet::new(),
             timers: Timers::default(),
             tick_timer: None,
@@ -175,6 +179,7 @@ impl Core {
             Action::LobbyTick => {
                 self.tick_timer = Some(self.set_timeout(5000.0, Action::LobbyTick));
                 self.lobby_tick();
+                self.buddy_tick();
             }
             Action::Later(k) => self.later_timer(k, id),
             Action::RedirectorIdle(c) => self.redirector_idle(c),

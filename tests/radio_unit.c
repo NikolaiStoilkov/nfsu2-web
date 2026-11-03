@@ -81,7 +81,7 @@ static void reset(void){
     MR32(OWNER + MUSIC_STREAM) = 0;
     MR8(STREAM_HANDLES) = 1;
     MR32(STREAM_TABLE) = STREAM;
-    MR32(STREAM + STREAM_VOICE) = END_OF_STREAM;
+    MR32(STREAM + STREAM_VOICE) = NO_VOICE;
     MR32(VOICE_TABLE) = VOICES;
     MR16(VOICE_COUNT) = 4;
     MR32(GAME_FLOW) = FLOW;
@@ -200,6 +200,22 @@ TEST(folder_song_ends__next_folder_song_plays){
     folder_song_lasts(40);
     folder_song_plays_in_main_menu();
     steps(40);
+    expect_folder_song(2);
+}
+TEST(folder_song_ends__no_reader_says_end_of_stream){
+    folder_song_lasts(40);
+    folder_song_plays_in_main_menu();
+    steps(40);
+    expect(g.ends_of_stream == 0, "the mixer frees no reader of the song: the game stops the song");
+    expect_folder_song(2);
+}
+TEST(page_writes_between_the_two_readers__both_sides_in_step_and_end_together){
+    g.page_writes_between = 1;
+    folder_song_lasts(40);
+    folder_song_plays_in_main_menu();
+    expect(g_song.read[0] == g_song.read[1], "both sides have taken the same frames");
+    steps(40);
+    expect(g.ends_of_stream == 0, "the mixer frees no reader of the song: the game stops the song");
     expect_folder_song(2);
 }
 TEST(game_song_ends_before_folder_song__same_folder_song_goes_on){
@@ -456,6 +472,58 @@ TEST(radio_off_untouched__game_runs_own_code){
     steps(SETTLED);
     expect_game_song();
     expect(g.stops == 0 && MR32(TABLE + 16u * 3u) == NAMES, "the game's table and songs untouched");
+}
+static void next_song_key(void){ g_page.skip++; }
+TEST(next_song_key_radio_off__game_stops_song_and_starts_its_next){
+    in_main_menu();
+    game_song_starts(3);
+    steps(SETTLED);
+    next_song_key();
+    steps(SETTLED);
+    expect_game_song();
+    expect(g.stops == 1 && g.last_index == 4, "one stop, and the game starts its next song");
+    expect_plaques(2, 0);
+    expect(MR32(TABLE + 16u * 4u) == NAMES, "the game's table untouched");
+}
+TEST(next_song_key_radio_off_twice__two_songs_on){
+    in_race();
+    game_song_starts(20);
+    steps(SETTLED);
+    next_song_key();
+    steps(SETTLED);
+    next_song_key();
+    steps(SETTLED);
+    expect_game_song();
+    expect(g.stops == 2 && g.last_index == 22, "a stop for each press");
+}
+TEST(next_song_key_radio_on__next_folder_song){
+    folder_song_plays_in_main_menu();
+    next_song_key();
+    steps(SETTLED);
+    expect_folder_song(2);
+    expect_plaques(2, 2);
+}
+TEST(next_song_key_in_drift__nothing_stopped){
+    folder_song_plays_in_main_menu();
+    to_race_without_song();
+    int stops = g.stops;
+    next_song_key();
+    steps(SETTLED);
+    expect(g.stops == stops, "no song, no stop");
+    expect_no_song();
+    expect_race_sounds();
+}
+TEST(next_song_key_in_pause_menu__let_go){
+    in_race();
+    game_song_starts(17);
+    steps(SETTLED);
+    game_pauses();
+    next_song_key();
+    steps(20);
+    game_resumes();
+    steps(SETTLED);
+    expect(g.stops == 0 && g.last_index == 17, "the press in the pause menu stops nothing, then or later");
+    expect_game_song();
 }
 TEST(all_songs_racing_back_in_main_menu__silence_no_game_song){
     radio_switched_on();

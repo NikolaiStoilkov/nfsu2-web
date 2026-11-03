@@ -56,7 +56,7 @@ impl NamesRoute {
 }
 
 /// `Bearer <43 characters of base64url>`: the token (as /vault takes it)
-fn token(q: &Request) -> Option<&str> {
+pub(super) fn token(q: &Request) -> Option<&str> {
     let t = q.headers.get("authorization")?.strip_prefix("Bearer ")?;
     (t.len() == 43 && t.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')).then_some(t)
 }
@@ -85,6 +85,16 @@ fn mine_json(m: &nfsu2_claims::Mine) -> Value {
 }
 
 impl App {
+    /// a name's claim as `owner` sees it; one the operator took away (control.rs rename) as one that reads as a slur:
+    /// nobody claims it
+    fn name_status(&self, n: &NamesRoute, name: &str, owner: Option<&str>, now: i64) -> Status {
+        match n.claims.status(name, owner, now) {
+            s @ (Status::Invalid | Status::Default) => s,
+            _ if self.bans.deny().has(name) => Status::Blocked,
+            s => s,
+        }
+    }
+
     /// /names (claimed names): see this module's doc
     pub(super) async fn names(&self, q: &mut Request, s: &mut Response, u: &url::Url) -> Res {
         let Some(n) = &self.names else { return self.not_found(q, s).await };
@@ -102,10 +112,10 @@ impl App {
                     return self.too_many_names(q, s).await;
                 }
                 let name = u.param("name").unwrap_or_default();
-                let mut v = status_json(&name, &n.claims.status(&name, owner.as_deref(), now));
+                let mut v = status_json(&name, &self.name_status(n, &name, owner.as_deref(), now));
                 let m = v.as_object_mut().expect("an object");
                 if let Some(alt) = u.param("alt") {
-                    m.insert("alt".into(), status_json(&alt, &n.claims.status(&alt, owner.as_deref(), now)));
+                    m.insert("alt".into(), status_json(&alt, &self.name_status(n, &alt, owner.as_deref(), now)));
                 }
                 if let Some(mine) = owner.as_deref().and_then(|o| n.claims.mine(o, now)) {
                     m.insert("mine".into(), mine_json(&mine));
@@ -132,7 +142,7 @@ impl App {
                 };
                 let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
                 // what would be refused anyway costs no claim, no check and no look into the cloud
-                match n.claims.status(&name, Some(&owner), now) {
+                match self.name_status(n, &name, Some(&owner), now) {
                     Status::Invalid => return self.json(q, s, 400, &json!({ "error": "invalid" })).await,
                     Status::Default => return self.json(q, s, 400, &json!({ "error": "default" })).await,
                     Status::Blocked => return self.json(q, s, 400, &json!({ "error": "blocked" })).await,
@@ -205,12 +215,19 @@ impl App {
         }
     }
 
+    /// a keyphrase used (its cloud saves read or saved, /vault): its claimed name lasts as long as it does
+    pub(super) fn names_used(&self, vault_id: &[u8; 32], now: i64) {
+        if let Some(n) = &self.names {
+            n.claims.used(&owner_of_id(vault_id), now);
+        }
+    }
+
     async fn too_many_names(&self, q: &Request, s: &mut Response) -> Res {
         self.plain(q, s, 429, "Too many requests", &[("retry-after", "60")], Cache::Store, true).await
     }
 
     /// a JSON answer (never cached)
-    async fn json(&self, q: &Request, s: &mut Response, code: u16, v: &Value) -> Res {
+    pub(super) async fn json(&self, q: &Request, s: &mut Response, code: u16, v: &Value) -> Res {
         let body = nfsu2_util::json::stringify(v);
         let mut h = self.headers(q, Cache::Store, true);
         h.set("content-type", "application/json");
@@ -239,6 +256,13 @@ mod tests {
         let body = json!({ "name": name }).to_string();
         let a = kit.request("POST", "/names", &[who, ("Content-Type", "application/json")], body.as_bytes()).await;
         (a.status, j(&a.body))
+    }
+
+    // a claim lasts as long as its keyphrase: as long as the cloud keeps one nobody uses
+    #[test]
+    fn a_claim_holds_as_long_as_a_keyphrase() {
+        let o = nfsu2_vault::VaultOptions::sized(std::path::PathBuf::from("/x"), 1.0);
+        assert_eq!(nfsu2_claims::HOLD_DAYS * nfsu2_claims::DAY_MS, o.unused_ms);
     }
 
     #[tokio::test]

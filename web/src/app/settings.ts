@@ -117,9 +117,10 @@ export const KEYS: readonly KeyDef[] = [
   { key: 'roam_crew', env: 'NFSU2_ROAM_CREW', kind: 'crews', ic: true, scope: 'web' },
   // and each one's colour, in the same order (crews.ts): bundle.m's K_RGBS
   { key: 'roam_crew_colours', env: 'NFSU2_ROAM_CREW_RGB', kind: 'rgbs', ic: true, scope: 'web' },
-  { key: 'roam_max_players', env: 'NFSU2_ROAM_MAX_PLAYERS', kind: 'int', vals: '2..33', ic: true, scope: 'web' },
-  { key: 'roam_max_cars', env: 'NFSU2_ROAM_MAX_CARS', kind: 'int', vals: '0..32', ic: true, scope: 'web', device: true },
-  { key: 'roam_collide', env: 'NFSU2_ROAM_COLLIDE', kind: 'bool', ic: true, scope: 'web' },
+  { key: 'roam_max_players', env: 'NFSU2_ROAM_MAX_PLAYERS', kind: 'int', vals: '2..49', ic: true, scope: 'web' },
+  { key: 'roam_max_cars', env: 'NFSU2_ROAM_MAX_CARS', kind: 'int', vals: '0..48', ic: true, scope: 'web', device: true },
+  // on, off (Ghost mode for players' cars), none (for traffic and tuners too); a module before none took it for on
+  { key: 'roam_collide', env: 'NFSU2_ROAM_COLLIDE', kind: 'enum', vals: 'on|off|none', ic: true, scope: 'web' },
   // quick chat's fixed phrases (web/src/app/quickchat.ts, runtime/roam_game.c say_*): the page has the picker, so not in
   // bundle.m's table
   { key: 'quick_chat', env: 'NFSU2_ROAM_SAY', kind: 'bool', ic: true, scope: 'web' },
@@ -129,7 +130,8 @@ export const KEYS: readonly KeyDef[] = [
   { key: 'roam_rate', env: 'NFSU2_ROAM_RATE', kind: 'int', vals: '10..30', ic: true, scope: 'web' },
   { key: 'roam_delay', env: 'NFSU2_ROAM_DELAY', kind: 'int', vals: '0..1000', ic: true, scope: 'web' },
   { key: 'roam_extrap', env: 'NFSU2_ROAM_EXTRAP', kind: 'int', vals: '0..1000', ic: true, scope: 'web' },
-  { key: 'roam_carpool_kb', env: 'NFSU2_ROAM_CARPOOL_KB', kind: 'int', vals: '0..128000', ic: true, scope: 'web' },
+  // only the Mac app reads it: in the browser the game sizes the pool (runtime/roam_game.c)
+  { key: 'roam_carpool_kb', env: 'NFSU2_ROAM_CARPOOL_KB', kind: 'int', vals: '0..128000', ic: true, scope: 'mac' },
   // LAN play
   { key: 'network', env: 'NFSU2_NET', kind: 'enum', vals: 'lan|on|off', scope: 'web' },
   { key: 'lan_interface', env: 'NFSU2_NET_IFACE', kind: 'ifname', scope: 'mac' },
@@ -154,10 +156,15 @@ export const KEYS: readonly KeyDef[] = [
   { key: 'language', env: 'NFSU2_LANGUAGE', kind: 'enum', vals: LANGUAGES.join('|'), scope: 'web' },
   // the movies' subtitles (runtime/language.c).  Not in bundle.m's table either
   { key: 'subtitles', env: 'NFSU2_SUBTITLES', kind: 'bool', scope: 'web' },
+  // the EA Trax songs: the game folder's (a soundtrack mod's uncensored versions) or EA's own, which the I/O worker
+  // reads in their place (pfdata/original: io-worker.ts dataFile; the page fetches ahead only the ones picked:
+  // datacache.ts).  Not in bundle.m's table either
+  { key: 'songs', env: 'NFSU2_SONGS', kind: 'enum', vals: 'uncensored|original', scope: 'web' },
   // the player's horn, which the others hear too (runtime/horn.c).  Not in bundle.m's table either: NFSU2_HORN there
   { key: 'horn', env: 'NFSU2_HORN', kind: 'enum', vals: HORNS.join('|'), scope: 'web' },
-  // the menus' and HUD's textures: a texture pack in place of the game's (runtime/web/texrep_web.c; the page fetches
-  // ahead only the one picked: datacache.ts).  Not in bundle.m's table: the Mac's packs are "textures"
+  // the menus', HUD's and maps' textures: texture packs in place of the game's (runtime/web/texrep_web.c; the page
+  // fetches ahead only those picked: datacache.ts).  uhud also turns on the maps' pack (resolveEnv: NFSU2_MAP_TEXTURES).
+  // Not in bundle.m's table: the Mac's packs are "textures"
   { key: 'ui_textures', env: 'NFSU2_UI_TEXTURES', kind: 'enum', vals: 'original|uhud', scope: 'web', device: true },
   // the players this one blocks in free roam, by name (the page's hello to the server: net/index.ts).  Not in bundle.m's
   // table: the Mac's free roam has no hub
@@ -205,10 +212,11 @@ export const TEMPLATE = `# NFSU2 settings, read at every launch.
 
 # The game's language: english, french, german, italian, spanish, dutch,
 # swedish, danish, korean, chinese, japanese, russian, thai, portuguese
-# (Brazil's), polish or turkish.  French, German, Italian, Spanish, Japanese
-# and Russian come with their dubbed voices and movies where the server has
-# the language packs; Russian, Portuguese, Polish and Turkish take their text
-# from them too.  [NFSU2_LANGUAGE]
+# (Brazil's), polish, turkish, hungarian or ukrainian.  French, German,
+# Italian, Spanish, Japanese and Russian come with their dubbed voices and
+# movies where the server has the language packs; Russian, Portuguese,
+# Polish, Turkish, Hungarian and Ukrainian take their text from them too.
+# [NFSU2_LANGUAGE]
 #language = english
 
 # The movies' subtitles: the PSA, the tutorials and the story, in every
@@ -217,6 +225,12 @@ export const TEMPLATE = `# NFSU2 settings, read at every launch.
 # with who says each line, where the server has its language pack.
 # [NFSU2_SUBTITLES]
 #subtitles = on
+
+# The EA Trax songs: uncensored = unedited, some in longer versions than
+# the game's (a soundtrack mod's); original = the versions the game shipped
+# with, where the server has them.  F7 plays the next song while you play.
+# [NFSU2_SONGS]
+#songs = uncensored
 
 # Sound output.  [NOSOUND, inverted]
 #sound = on
@@ -298,12 +312,15 @@ export const TEMPLATE = `# NFSU2 settings, read at every launch.
 # original game.  [NFSU2_HEADLIGHTS]
 #other_headlights = players
 
-# The menus' and the HUD's textures: original = the game's; uhud =
+# The menus', the HUD's and the maps' textures: original = the game's; uhud =
 # LunicAura106's Upscaled HUD (nfsmods.xyz/mod/4319): the menus, the race
 # HUD, the fonts and the car and brand logos redrawn at four times their
-# size, where this server has the mod's texture pack (a language pack's own
+# size, and JeansBig's Detailed Map (nfsmods.xyz/mod/4485): the minimap's
+# and the world map's maps redrawn at 2048x2048 with the missing shortcuts,
+# where this server has the mods' texture packs (a language pack's own
 # fonts stay; most phones' GPUs decode the larger textures into four times
-# the memory).  [NFSU2_UI_TEXTURES]
+# the memory; NFSU2_MAP_TEXTURES = original keeps the game's maps).
+# [NFSU2_UI_TEXTURES]
 #ui_textures = original
 
 # ---- Frame rate ----------------------------------------------------------
@@ -415,26 +432,32 @@ export const TEMPLATE = `# NFSU2 settings, read at every launch.
 # the players near you (its free-roam hub).  [NFSU2_ROAM_DISCOVERY]
 #roam_discovery = on
 # Largest group: you and the players you exchange cars with at once (2 to
-# 33; the server picks the nearest), and other players' cars shown at once
-# (16, 20, 24, 28 or 32, the nearest; phones start at 16, tablets at 24).
+# 49; the server picks the nearest), and other players' cars shown at once
+# (0 to 48, the nearest; the page offers 16, 24, 32, 40 or 48: 32 on
+# computers, 16 on phones, 24 on tablets): the server sends you as many
+# players' cars as that.
 # [NFSU2_ROAM_MAX_PLAYERS, NFSU2_ROAM_MAX_CARS]
-#roam_max_players = 33
+#roam_max_players = 49
 #roam_max_cars = 32
 # on = the other players' cars are solid: drawn where they are now, and one
 # that appears on your car lets you through until you are apart.
-# off = Ghost mode: you drive through them, and they through yours.
-# [NFSU2_ROAM_COLLIDE]
+# off = Ghost mode for players: you drive through their cars, and they
+# through yours.  none = Ghost mode for everything: traffic and the game's
+# tuners pass through you too (in free roam with others; races stay as they
+# are), but not a tuner you race in an outrun.  An outrun with another
+# player is solid only when you both have on.  [NFSU2_ROAM_COLLIDE]
 #roam_collide = on
-# Quick chat: say one of your sixteen set phrases to the players near you
-# (1 to 4, then 1 to 4; a controller's right stick twice; the chat button on
-# a touch screen), and see theirs over their cars.  off = neither, and the
-# others send you none.  [NFSU2_ROAM_SAY]
+# Quick chat: say one of your sixteen set phrases to the players near you in
+# free roam, or to everyone in a multiplayer race, while driving and on its
+# results (1 to 4, then 1 to 4; a controller's right stick pressed in, then
+# flicked twice; the chat button on a touch screen), and see theirs.  off = neither, and the others
+# send you none in free roam.  [NFSU2_ROAM_SAY]
 #quick_chat = on
 # Your sixteen: the phrases' numbers (web/src/app/phrases.ts), four for each
 # of 1 to 4, and the four groups' names (hi, reply, thanks, nice, drive,
 # meet, race, react or help).  The start page's Your phrases picks them.
 # [NFSU2_ROAM_SAY_PHRASES, NFSU2_ROAM_SAY_GROUPS]
-#quick_chat_phrases = 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+#quick_chat_phrases = 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,152
 #quick_chat_groups = hi,reply,drive,race
 # Snapshots per second (10 to 30), the delay ghost cars are shown with in
 # ms (0 to 1000) and the longest cars are extrapolated in ms (0 to 1000).
@@ -442,10 +465,6 @@ export const TEMPLATE = `# NFSU2 settings, read at every launch.
 #roam_rate = 20
 #roam_delay = 100
 #roam_extrap = 250
-# The free-roam car memory pool in KB, raised for other players' cars (the
-# game's own is 11000; a value at or below it is ignored, as it would leave
-# no room for them).  [NFSU2_ROAM_CARPOOL_KB]
-#roam_carpool_kb = 48000
 `;
 
 /** The template's default for a key ("#key = value"), '' if the template leaves it empty or does not list it. */
@@ -847,6 +866,10 @@ export function resolveEnv(text: string | null, environment: Record<string, stri
   }
   for (const [k, v] of Object.entries(APP_DEFAULTS)) if (!(k in env)) { env[k] = v; source[k] = 'default'; }
   for (const [k, v] of Object.entries(host)) if (!(k in env)) { env[k] = v; source[k] = 'host'; }
+  // the maps' pack (TEXPACKS/detailed.pak) comes with the menus' and HUD's: ui_textures = uhud shows both.
+  // NFSU2_MAP_TEXTURES = original in settings.ini keeps the game's maps (a test knob)
+  const ui = (env.NFSU2_UI_TEXTURES ?? '').toLowerCase();
+  if (!('NFSU2_MAP_TEXTURES' in env) && ui && ui !== 'original') { env.NFSU2_MAP_TEXTURES = 'detailed'; source.NFSU2_MAP_TEXTURES = source.NFSU2_UI_TEXTURES; }
   return { env, source, notes, file, byEnv, other };
 }
 

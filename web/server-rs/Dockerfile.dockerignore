@@ -2,10 +2,12 @@
 # out/ or anything else of this checkout.  A list of what may go in, not of what may not.
 *
 !app/registry-defaults.txt
+!CHANGELOG.md
 !web/package.json
 !web/package-lock.json
 !web/build.mjs
 !web/index.html
+!web/tools/i18n-keys.mjs
 !web/src/
 !web/server-rs/
 web/server-rs/target/

@@ -2,7 +2,7 @@
  *
  * Included at the end of vsemu.c (wasm builds, or native with -DVSEMU_WGSL for
  * offline tools) so it shares the parser's private VSProg/VSIns and token
- * macros.  The authoritative contract with the renderer is docs/web/gpu-abi.md:
+ * macros.  Its contract with the renderer:
  * module layout, bindings, structs, override constants.
  *
  * Semantics are the Mac backends' on purpose (the Mac build is the reference
@@ -41,7 +41,7 @@ static void wb_put(WBuf *b, const char *fmt, ...){
     b->n += (size_t)w;
 }
 
-/* ---- shared module text (gpu-abi.md sections 2-5) ---- */
+/* ---- shared module text ---- */
 static const char W_VOUT[] =
     "struct VOut {\n"
     "  @builtin(position) pos: vec4f,\n"
@@ -50,9 +50,9 @@ static const char W_VOUT[] =
     "  @location(6) fog: f32,\n"
     "}\n";
 /* K is a 64 KB window of the frame's VS constant arena, bound once for many
- * draws; a draw's block {stride, tsel, base, pad; c[0..255]} starts at row
+ * draws; a draw's block {stride, tsel, base, target w | h << 16; c[0..255]} starts at row
  * kb = instance_index (the draw's firstInstance), so a draw no longer needs a
- * bind group of its own (gpu-abi.md section 3). */
+ * bind group of its own. */
 static const char W_VSPAR[] =
     "struct VSWin { c: array<vec4f, " WSTR(GW_KWIN_ROWS) "> }\n"
     "@group(0) @binding(0) var<storage, read> VB: array<u32>;\n"
@@ -277,7 +277,11 @@ static int w_defs_finite(const VSProg *p){
  *                                 x falloff ramp (stage 2)
  *     mad rA.rgb, rA, c0, v0      x HEADLIGHTCOLOR + the vertex light
  * before the texture multiply; after that mad, every other car's light is
- * added the same way, from its coordinate uv1 * t and its own colour. */
+ * added the same way, from its coordinate uv1 * t and its own colour.  p.z
+ * is not the projector's depth but the point's height above that car's road
+ * plane (metres): the light fades out from 2 m + 6 % of the distance ahead
+ * (p.w) below it, gone 1.5 m lower, so a car on an overpass does not light
+ * the street under it. */
 static const char W_HL[] =
     "struct HLight { t: mat4x4f, col: vec4f }\n"
     "struct HLPar { n: u32, s: f32, o: f32, pad: f32, l: array<HLight, " WSTR(GW_HL_MAX) "> }\n"
@@ -288,7 +292,8 @@ static const char W_HL[] =
     "    let p = q * H.l[k].t;\n"
     "    let l1 = textureSample(tex1, smp1, p.xy / p.w).rgb;\n"
     "    let l2 = textureSample(tex2, smp2, vec2f(H.s * p.w + H.o, v)).rgb;\n"
-    "    a += select(vec3f(0.0), l1 * l2 * H.l[k].col.rgb, p.w > 0.0);\n"
+    "    let road = saturate((p.z + 3.5 + 0.06 * p.w) / 1.5);\n"
+    "    a += select(vec3f(0.0), l1 * l2 * H.l[k].col.rgb * road, p.w > 0.0);\n"
     "  }\n"
     "  return a;\n"
     "}\n";
@@ -663,11 +668,16 @@ int vs_to_wgsl(const VSProg *p, int id, const int decl[16][2], char *out, size_t
                 "  var oT0 = vec4f(0.0); var oT1 = vec4f(0.0); var oT2 = vec4f(0.0); var oT3 = vec4f(0.0);\n"
                 "  var oFog = vec4f(1.0);\n");
     wb_put(&ob, "%s", bodybuf);
-    /* Epilogue as the Mac: no half-pixel offset, no colour clamp;
-     * D3DTSS_TEXCOORDINDEX applied here so the pixel stage reads plain
-     * interpolants. */
+    /* Epilogue: D3D9's pixel centres, no colour clamp; D3DTSS_TEXCOORDINDEX
+     * applied here so the pixel stage reads plain interpolants.
+     * D3D9 samples pixel x at x, WebGPU at x + 0.5: the picture moves half a
+     * pixel right and down (KH.w: the target's width | height << 16, 0 = as
+     * it is; gpu_web.c target_wh), so the game's post passes, which add half
+     * a texel to their UVs, read texel centres again (without it, half a
+     * texel down and right, and the last row and column at 1.0). */
     wb_put(&ob, "  var o: VOut;\n"
-                "  o.pos = oPos;\n"
+                "  let ts = max(vec2f(f32(KH.w & 0xFFFFu), f32(KH.w >> 16u)), vec2f(1.0));\n"
+                "  o.pos = vec4f(oPos.xy + select(vec2f(0.0), vec2f(1.0, -1.0) / ts, KH.w != 0u) * oPos.w, oPos.zw);\n"
                 "  o.col0 = oD0; o.col1 = oD1;\n"
                 "  o.uv0 = tpick(KH.y & 3u, oT0, oT1, oT2, oT3);\n"
                 "  o.uv1 = tpick((KH.y >> 8u) & 3u, oT0, oT1, oT2, oT3);\n"

@@ -13,9 +13,9 @@
 //          settings.ini, logs).  Closing a file the game wrote there tells
 //          the page ({ t: 'saved', path }: "Progress saved", F9's last save).
 import {
-  CTL_IO_DOORBELL, E, MAX_THREADS, Op, RPC_DONE, RPC_POSTED, RPC_SLOT, RPC_TAKEN, type BootConfig,
+  CTL_IO_BEAT, CTL_IO_DOORBELL, E, IO_SLOW_MS, MAX_THREADS, Op, opName, RPC_DONE, RPC_POSTED, RPC_SLOT, RPC_TAKEN, type BootConfig,
 } from './proto';
-import { BLOCK, CACHE_DIR, av1Path, blockRuns, cacheKey, dataUrl, openCacheFile, putBlock, runUrl, type CacheFile, type Manifest } from './datacache';
+import { BLOCK, CACHE_DIR, av1Path, songsPath, blockRuns, cacheKey, cacheOpen, dataUrl, openCacheFile, putBlock, runUrl, type CacheFile, type Manifest } from './datacache';
 import { movieClose, movieDecode, movieOpen } from './movie';
 
 interface Init { memory: WebAssembly.Memory; ctl: SharedArrayBuffer; rpc: SharedArrayBuffer; cfg: BootConfig }
@@ -31,7 +31,7 @@ const dv = () => new DataView(memory.buffer);
 interface DNode { name: string; dir: boolean; size: number; mtime: number; kids?: Map<string, DNode>; byLower?: Map<string, DNode>; path: string; ino: number }
 let dataRoot: DNode;
 let inoNext = 16;
-let runs: { url: string; max: number } | null = null;     // the server's compressed blocks (datacache.ts blockRuns)
+let runs: { url: string; max: number };     // the server's compressed blocks (datacache.ts blockRuns)
 function mkdirNode(name: string, path: string): DNode { return { name, dir: true, size: 0, mtime: 0, kids: new Map(), byLower: new Map(), path, ino: inoNext++ }; }
 
 async function loadManifest() {
@@ -63,10 +63,16 @@ function dataLookup(rel: string): DNode | null {
   return cur;
 }
 /** A file the game opens: a movie's AV1 copy in its place where the page plays AV1 (NFSU2_MOVIE_CODEC = av1,
- *  movie.ts) and the folder has one (tools/movies_av1.py), else the file itself. */
+ *  movie.ts) and the folder has one (tools/movies_av1.py); EA's own songs in place of the music's files with
+ *  settings.ini songs = original (NFSU2_SONGS) where the folder has them (tools/musicpack.py --original); else the
+ *  file itself. */
 function dataFile(rel: string): DNode | null {
   const n = dataLookup(rel);
-  if (!n || n.dir || cfg.env.NFSU2_MOVIE_CODEC !== 'av1') return n;
+  if (!n || n.dir) return n;
+  const s = cfg.env.NFSU2_SONGS?.trim().toLowerCase() === 'original' ? songsPath(n.path) : null;
+  const o = s ? dataLookup(s) : null;
+  if (o && !o.dir) return o;
+  if (cfg.env.NFSU2_MOVIE_CODEC !== 'av1') return n;
   const a = av1Path(n.path);
   return (a && dataLookup(a)) || n;
 }
@@ -87,23 +93,54 @@ let cacheDir: FileSystemDirectoryHandle | null = null;
 // waiting on it, ~8 ms in Firefox and ~2 ms in Chrome (NVMe disk, 2026-10-29; a hard disk takes longer).  Among a
 // free-roam crowd's cars 64 were too few: some 230 files were closed and opened again a minute.  Chrome and Firefox
 // on Windows took 2000 handles at once without a word, so there 512 stay open.
-const CACHE_OPEN = /Windows/.test(navigator.userAgent) && /\b(Chrome|Firefox)\//.test(navigator.userAgent) ? 512 : 64;
+const CACHE_OPEN = cacheOpen(navigator.userAgent);
 const cacheFiles = new Map<string, Promise<CacheFile | null>>(), cacheSeen = new Set<string>();
 let keeping = true, kept = 0;                              // blocks still go into the cache (keepBlock)
 
+// A cache file that has not opened in OPEN_MS is given up for this game: its reads come from the server, as a file
+// this PC does not keep.  A player's game (Chrome on Linux, 64 files open and some 50 closed and opened again a minute)
+// read nothing more after one of its reads went into this worker and never came out, all from the cache: its free-roam
+// friends' cars stopped coming in, and leaving for the garage waited for good (2026-11-02, game ee850688).  The open
+// is the one step there with no limit (a fetch has STALL_MS); it took up to 15 s on a player's PC that did come back.
+const OPEN_MS = 10000;
+const cacheSkip = new Set<string>();
+let opens = 0;
 // Use the file at once, in the same task: a file that is not among the CACHE_OPEN newest is closed.
 async function cacheFile(n: DNode) {
   if (!cacheDir) return null;
   const k = cacheKey(n);
+  if (cacheSkip.has(k)) return null;
   let p = cacheFiles.get(k);
   if (p) { cacheFiles.delete(k); cacheFiles.set(k, p); return p; }
-  const t0 = performance.now(), again = cacheSeen.has(k);
+  const t0 = performance.now(), again = cacheSeen.has(k), f = faults(), dir = cacheDir;
   cacheSeen.add(k);
-  p = openCacheFile(cacheDir, n).then(cf => {
-    const ms = performance.now() - t0;
-    sum.opened++; sum.openMs += ms; if (ms > sum.openMax) sum.openMax = ms; if (again) sum.reopened++;
-    return cf;
-  }, e => { if (keeping) note(`[data] ${n.path} is not kept on this PC: ${e}`); return null; });
+  steps.set(`${n.path} (its cache file)`, { t0, at: 'opening its cache file' });
+  // NFSU2_DATA_FAULT open:N: every Nth open never answers
+  const opening = f.open && ++opens % f.open === 0 ? new Promise<CacheFile>(() => {}) : openCacheFile(dir, n);
+  p = new Promise<CacheFile | null>(res => {
+    let over = false;
+    const late = setTimeout(() => {
+      over = true; cacheSkip.add(k); steps.delete(`${n.path} (its cache file)`);
+      note(`[data] ${n.path}: its cache file did not open in ${OPEN_MS / 1000} s; this game reads it from the server`);
+      res(null);
+    }, OPEN_MS);
+    opening.then(cf => {
+      clearTimeout(late); steps.delete(`${n.path} (its cache file)`);
+      const ms = performance.now() - t0;
+      // too late: closed again, the file stays given up
+      if (over) { try { cf.h.close(); cf.haveH.close(); } catch { /* gone */ } note(`[data] ${n.path}: its cache file opened after ${(ms / 1000).toFixed(1)} s, too late`); return; }
+      sum.opened++; sum.openMs += ms; if (ms > sum.openMax) sum.openMax = ms; if (again) sum.reopened++;
+      res(cf);
+    }, e => {
+      clearTimeout(late); steps.delete(`${n.path} (its cache file)`);
+      if (over) return;
+      if (keeping) note(`[data] ${n.path} is not kept on this PC: ${e}`);
+      // the site's data deleted (the cache folder with it): the save folder back before the game's next save needs it
+      // (any error: Firefox answers some calls in a removed folder with UnknownError)
+      void saveGone().then(gone => { if (gone) void recover(); });
+      res(null);
+    });
+  });
   cacheFiles.set(k, p);
   for (const [ok, op] of cacheFiles) {
     if (cacheFiles.size <= CACHE_OPEN) break;
@@ -139,7 +176,7 @@ const note = (s: string) => (self as unknown as Worker).postMessage({ t: 'log', 
 // NFSU2_DATA_FAULT (tests, the web suite's datafault): fail:N fails every Nth try as a lost connection, hang:N
 // leaves every Nth unanswered until its stall timer, stall:MS sets that timer, deny:N loses every try at the
 // compressed address of each file's every Nth block (only its byte range comes), full:N fills this PC's cache
-// at the Nth block this game keeps.
+// at the Nth block this game keeps, open:N leaves every Nth cache file's opening unanswered (cacheFile's OPEN_MS).
 // Blocks waiting for a turn go by priority: the track's stream file first (a section the game waits for in the world
 // is a "Loading" screen in the middle of a drive), then the game's other reads (a friend's car, music, speech), then
 // the reading ahead of the track (readAhead).  That one starts only while the game fetches nothing (on a slow line a
@@ -147,7 +184,7 @@ const note = (s: string) => (self as unknown as Worker).postMessage({ t: 'log', 
 const FETCHES = 8, STALL_MS = 20000, SLOW_MS = 5000;
 const P_AHEAD = 0, P_GAME = 1, P_TRACK = 2, FILL_FETCHES = 2;
 interface Ticket { pri: number; ahead?: boolean }
-let fetching = 0, aheadFetching = 0, tries = 0, fault: { fail: number; hang: number; stall: number; deny: number; full: number } | null = null;
+let fetching = 0, aheadFetching = 0, tries = 0, fault: { fail: number; hang: number; stall: number; deny: number; full: number; open: number } | null = null;
 const fetchWait: { t: Ticket; go: () => void }[] = [];
 const mayFetch = (t: Ticket) => fetching < FETCHES &&
   (t.pri > P_AHEAD || fetching === aheadFetching && aheadFetching < FILL_FETCHES);
@@ -166,7 +203,7 @@ function faults() {
   if (!fault) {
     const kv = new Map((cfg.env?.NFSU2_DATA_FAULT ?? '').split(',').map(p => p.split(':') as [string, string]));
     const num = (k: string) => +(kv.get(k) ?? 0) || 0;
-    fault = { fail: num('fail'), hang: num('hang'), stall: num('stall') || STALL_MS, deny: num('deny'), full: num('full') };
+    fault = { fail: num('fail'), hang: num('hang'), stall: num('stall') || STALL_MS, deny: num('deny'), full: num('full'), open: num('open') };
   }
   return fault;
 }
@@ -228,9 +265,9 @@ async function fetchBlock(n: DNode, bi: number, start: number, len: number, t: T
   const what = `${n.path} block ${bi}${t.ahead ? ' (read ahead)' : ''}`, t0 = performance.now();
   const slow = setTimeout(() => note(`[data] ${what}: waiting for the server for ${SLOW_MS / 1000} s`), SLOW_MS);
   try {
-    const run = runs ? runUrl(runs.url, n.path, bi, 1, n) : null, range = dataUrl(cfg.dataBase, n.path), f = faults();
+    const run = runUrl(runs.url, n.path, bi, 1, n), range = dataUrl(cfg.dataBase, n.path), f = faults();
     for (let k = 1, wait = 250, sized = 0, lost = 0; ; k++, wait = Math.min(wait * 2, 8000)) {
-      const ranged = !run || lost >= 2 && k % 2 === 1, by = run && ranged ? ' (as a byte range)' : '';
+      const ranged = lost >= 2 && k % 2 === 1, by = ranged ? ' (as a byte range)' : '';
       const r = await fetchOnce(ranged ? range : run, start, len, ranged, !ranged && f.deny > 0 && (bi + 1) % f.deny === 0);
       if (r instanceof Uint8Array) {
         const s = (performance.now() - t0) / 1000;
@@ -263,6 +300,9 @@ function keepBlock(cf: CacheFile, n: DNode, bi: number, b: Uint8Array) {
 // the blocks being read: who waits for each (a read of the game asking for a block the reading ahead asked for first
 // raises its priority to its own)
 const tickets = new Map<string, Ticket>();
+// what each block being read waits for, since when (the watchdog's note of a request that does not come back)
+const steps = new Map<string, { t0: number; at: string }>();
+const step = (key: string, at: string) => { const s = steps.get(key); if (s) s.at = at; };
 async function getBlock(n: DNode, bi: number, pri: number): Promise<Uint8Array> {
   const key = n.path + '#' + bi;
   dataSummary(performance.now());
@@ -277,14 +317,17 @@ async function getBlock(n: DNode, bi: number, pri: number): Promise<Uint8Array> 
   const t: Ticket = { pri };
   p = (async () => {
     const start = bi * BLOCK, len = Math.min(BLOCK, n.size - start);
+    steps.set(key, { t0: performance.now(), at: 'its cache file' });
     const cf = await cacheFile(n);
     if (cf && cf.have[bi]) {
       try {
         const b = new Uint8Array(len); cf.h.read(b, { at: start }); memPut(key, b); sum.local++; return b;
       } catch (e) { note(`[data] ${n.path} block ${bi}: the cache file did not read (${e}); from the server`); }
     }
+    step(key, 'the server');
     const b = await fetchBlock(n, bi, start, len, t);
     // the file again: the one from before the fetch may have been closed meanwhile (CACHE_OPEN)
+    step(key, 'its cache file, to keep it');
     const cf2 = await cacheFile(n);
     if (cf2) keepBlock(cf2, n, bi, b);
     // a block read ahead stays out of the memory while this PC keeps it: the blocks being read stay there
@@ -292,7 +335,7 @@ async function getBlock(n: DNode, bi: number, pri: number): Promise<Uint8Array> 
     return b;
   })();
   inflight.set(key, p); tickets.set(key, t);
-  try { return await p; } finally { inflight.delete(key); tickets.delete(key); }
+  try { return await p; } finally { inflight.delete(key); tickets.delete(key); steps.delete(key); }
 }
 
 // ------------------------------------------------------- reading ahead ----
@@ -362,6 +405,7 @@ async function dataRead(n: DNode, pos: number, dst: { ptr: number; len: number }
 // ---------------------------------------------------------------- /save ----
 let saveRoot: FileSystemDirectoryHandle;
 async function saveDirAt(parts: string[], create: boolean): Promise<FileSystemDirectoryHandle | null> {
+  if (recovering) await recovering;
   let d = saveRoot;
   for (const p of parts) {
     if (!p || p === '.') continue;
@@ -373,6 +417,7 @@ async function saveDirAt(parts: string[], create: boolean): Promise<FileSystemDi
 async function saveEntry(rel: string): Promise<{ parent: FileSystemDirectoryHandle; name: string; kind: 'file' | 'directory' | null; h: FileSystemHandle | null } | null> {
   const parts = rel.split('/').filter(p => p && p !== '.');
   if (parts.some(p => p === '..')) return null;
+  if (recovering) await recovering;
   if (!parts.length) return { parent: saveRoot, name: '', kind: 'directory', h: saveRoot };
   const parent = await saveDirAt(parts.slice(0, -1), false);
   if (!parent) return null;
@@ -382,12 +427,99 @@ async function saveEntry(rel: string): Promise<{ parent: FileSystemDirectoryHand
   return { parent, name, kind: null, h: null };
 }
 
+// Why a file of the save folder did not open, for the log (a save that fails is a "[file] CANNOT OPEN" line of the
+// game's, which says no more), said once each.  Chrome refuses a sync access handle while the page writes the file
+// (createWritable: NoModificationAllowedError), never for its reads (getFile).
+//
+// A browser that clears the site's data while a game runs (Discord 2026-10-31: in each game, after a while, every new
+// open of a game data cache file or a save failed with NotFoundError, and each next start found the save folder
+// empty) leaves this worker's folder handles on folders that are gone, and every save after it failed.  So when an
+// open or a create in /save, or a cache file's open, finds the save folder gone (recover), this worker makes it and
+// the cache folder again, tells the page ('save-gone'), which writes the saves back into it (the cloud's, else those
+// of the game's start: shell.ts saveGone), and holds every /save call until the page answers ('save-ready'),
+// SAVE_WAIT_MS at most: under the stall watchdog's 15 s (runtime/watchdog.c), as the game's thread waits for it like
+// for any slow disk.  The call that found it then runs again: the game's save lands on what came back.
+const troubleSaid = new Set<string>();
+/** true: the save folder was gone and is made again (the caller tries once more) */
+async function saveTrouble(what: string, err: unknown, again = false): Promise<boolean> {
+  const name = (err as Error)?.name ?? 'Error';
+  // whatever the call answered (Chrome: NotFoundError; Firefox: UnknownError for a create in a removed folder), the
+  // folder itself is looked at: gone, it is made again
+  if (!again && await saveGone()) { await recover(); return true; }
+  if (!troubleSaid.has(name)) { troubleSaid.add(name); note(`[save] ${what}: ${name}: ${(err as Error)?.message ?? err}`); }
+  return false;
+}
+/** whether this worker's save folder is gone (keys() of a folder deleted under its handle answers NotFoundError, in
+ *  Chrome and Firefox alike) */
+async function saveGone(): Promise<boolean> {
+  try { for await (const _ of (saveRoot as unknown as { keys(): AsyncIterable<string> }).keys()) break; return false; }
+  catch (e) { return (e as Error)?.name === 'NotFoundError'; }
+}
+const SAVE_WAIT_MS = 12_000;
+let recovering: Promise<void> | null = null, saveAnswered: (() => void) | null = null;
+/** a profile's own file: "NFS Underground 2/<NAME>/<NAME>" (any case), not a cover shoot's ("<NAME> DVD 1") */
+const isProfilePath = (p: string[]) => p.length === 3 && p[0] === 'NFS Underground 2' && p[1].toLowerCase() === p[2].toLowerCase() &&
+  !/ (DVD|Magazine) \d+$/.test(p[1]);
+/** the save folder's generation: one more each time it is made again (an Fd's of another was opened in a deleted one) */
+let rootGen = 1;
+/**
+ * A file the game wrote into a save folder the browser deleted since it opened it (its sync handle on a file that is
+ * gone): its bytes, read back from that handle, written again into the folder made again, as the newest of that path.
+ * False: they could not be read back or written, so the save is lost (the game saves again at its next save point).
+ */
+async function salvage(rel: string, bytes: Uint8Array | null): Promise<boolean> {
+  if (await saveGone()) await recover();
+  const p = rel.split('/');
+  // never zeros, nor a profile that is none, over what the refill brought back
+  if (bytes && (bytes.every(b => b === 0) || isProfilePath(p) &&
+      (bytes.length < 8 || bytes[0] !== 0x32 || bytes[1] !== 0x30 || bytes[2] !== 0x43 || bytes[3] !== 0x4d ||
+       new DataView(bytes.buffer, bytes.byteOffset).getUint32(4, true) !== bytes.length))) bytes = null;
+  if (bytes) try {
+    const d = await saveDirAt(p.slice(0, -1), true);
+    if (d) {
+      const sh = await ((await d.getFileHandle(p[p.length - 1], { create: true })) as any).createSyncAccessHandle({ mode: 'readwrite-unsafe' }) as FileSystemSyncAccessHandle;
+      sh.truncate(0); sh.write(bytes, { at: 0 }); sh.flush(); sh.close();
+      note(`[save] a file the game wrote as the browser deleted the save folder: written again into the new one (${bytes.length} bytes)`);
+      return true;
+    }
+  } catch { /* lost */ }
+  note('[save] a file the game wrote as the browser deleted the save folder could not be written again: that save is lost');
+  return false;
+}
+function recover(): Promise<void> {
+  recovering ??= (async () => {
+    const t0 = performance.now();
+    const opfs = await navigator.storage.getDirectory();
+    saveRoot = await opfs.getDirectoryHandle(cfg.saveDir, { create: true });
+    rootGen++;
+    if (cacheDir) {
+      // the cache files open are of the folder that went: opened again in the new one, and kept again
+      cacheFiles.clear(); cacheSeen.clear(); aheadDone.clear(); keeping = true; kept = 0;
+      try { cacheDir = await opfs.getDirectoryHandle(CACHE_DIR, { create: true }); } catch { cacheDir = null; }
+    }
+    const top = fds.get(4);
+    if (top?.mount === 'save') top.dh = saveRoot;            // /save itself, as the game lists it
+    note('[save] the save folder is gone: the browser deleted this site\'s data while the game ran (low disk space, or its settings?); made again, the page puts the saves back');
+    const answered = await new Promise<boolean>(res => {
+      saveAnswered = () => res(true);
+      setTimeout(() => res(false), SAVE_WAIT_MS);
+      (self as unknown as Worker).postMessage({ t: 'save-gone' });
+    });
+    saveAnswered = null;
+    note(answered ? `[save] the saves are back after ${((performance.now() - t0) / 1000).toFixed(1)} s: the game saves on`
+      : `[save] the page did not put the saves back within ${SAVE_WAIT_MS / 1000} s: the game saves on without them`);
+  })().finally(() => { recovering = null; });
+  return recovering;
+}
+
 // ------------------------------------------------------------------ fds ----
 interface Fd {
   mount: 'data' | 'save' | 'dev'; kind: 'dir' | 'file'; path: string; pos: number; append: boolean;
   node?: DNode;                                   // /data
   sh?: FileSystemSyncAccessHandle; dh?: FileSystemDirectoryHandle; fh?: FileSystemFileHandle;   // /save
   wrote?: boolean;                                // /save: written or truncated since it was opened
+  gen?: number;                                   // /save: rootGen when it was opened
+  end?: number;                                   // /save: its size as this fd made it (a deleted file's getSize() reads 2^64-1)
   preopen?: string; dirents?: { name: string; type: number; ino: number }[];
 }
 const fds = new Map<number, Fd>();
@@ -426,7 +558,7 @@ async function statSave(rel: string): Promise<{ type: number; size: number; mtim
 }
 
 // O flags (path_open oflags): 1 CREAT, 2 DIRECTORY, 4 EXCL, 8 TRUNC; fdflags: 1 APPEND
-async function op(o: Op, a: bigint[]): Promise<number> {
+async function op(o: Op, a: bigint[], again = false): Promise<number> {
   const n = (i: number) => Number(a[i]);
   switch (o) {
     case Op.FdPrestatGet: {
@@ -464,20 +596,38 @@ async function op(o: Op, a: bigint[]): Promise<number> {
       if (oflags & 2) return e.kind ? E.NOTDIR : E.NOENT;
       if (!e.kind && !(oflags & 1)) return E.NOENT;
       if (e.kind && oflags & 4) return E.EXIST;
-      const fh = e.kind ? e.h as FileSystemFileHandle : await e.parent.getFileHandle(e.name, { create: true });
+      let fh: FileSystemFileHandle;
+      try { fh = e.kind ? e.h as FileSystemFileHandle : await e.parent.getFileHandle(e.name, { create: true }); }
+      catch (err) { return await saveTrouble('a file of the save folder could not be made', err, again) ? op(o, a, true) : E.IO; }
       let sh: FileSystemSyncAccessHandle;
-      try { sh = await (fh as any).createSyncAccessHandle({ mode: 'readwrite-unsafe' }); } catch { return E.ACCES; }
+      try { sh = await (fh as any).createSyncAccessHandle({ mode: 'readwrite-unsafe' }); }
+      catch (err) { return await saveTrouble('a file of the save folder could not be opened', err, again) ? op(o, a, true) : E.ACCES; }
       if (oflags & 8) sh.truncate(0);
-      const fd = allocFd({ mount: 'save', kind: 'file', path: rel, pos: 0, append: !!(fdflags & 1), sh, fh, wrote: !!(oflags & 8) });
+      const fd = allocFd({ mount: 'save', kind: 'file', path: rel, pos: 0, append: !!(fdflags & 1), sh, fh, wrote: !!(oflags & 8), gen: rootGen,
+        end: oflags & 8 ? 0 : sh.getSize() });
       dv().setUint32(n(8), fd, true); return 0;
     }
     case Op.FdClose: {
       const f = fds.get(n(0)); if (!f) return E.BADF;
       if (f.preopen) return 0;
-      if (f.sh) { f.sh.flush(); f.sh.close(); }
+      let lost = false;
+      if (f.sh) {
+        // written into a save folder the browser deleted since it was opened: its bytes went with that folder
+        const away = f.mount === 'save' && !!f.wrote && (f.gen !== rootGen || await saveGone());
+        let bytes: Uint8Array | null = null;
+        if (away) try {
+          // (getSize() of a deleted file is 2^64-1 in Chrome: its size as this fd made it, and only if all of it reads back)
+          const n = f.end ?? 0, b = new Uint8Array(n);
+          bytes = n > 0 && f.sh.read(b, { at: 0 }) === n ? b : null;
+        } catch { bytes = null; }
+        try { f.sh.flush(); f.sh.close(); } catch (e) { if (!away) throw e; }
+        if (away) lost = !await salvage(f.path, bytes);
+      }
       fds.delete(n(0));
-      // posted before the call returns, so the page hears of a save before the game can exit after it
-      if (f.wrote) (self as unknown as Worker).postMessage({ t: 'saved', path: f.path });
+      // posted before the call returns, so the page hears of a save before the game can exit after it; never for one
+      // that went with a deleted folder (no "Progress saved" for it)
+      if (f.wrote && !lost) (self as unknown as Worker).postMessage({ t: 'saved', path: f.path });
+      else if (lost) (self as unknown as Worker).postMessage({ t: 'lost', path: f.path });
       return 0;
     }
     case Op.FdRead: case Op.FdPread: {
@@ -501,7 +651,7 @@ async function op(o: Op, a: bigint[]): Promise<number> {
       if (f.mount === 'dev') { dv().setUint32(pw ? n(4) : n(3), src.reduce((a, x) => a + x.len, 0), true); return 0; }
       let pos = pw ? n(3) : (f.append ? f.sh!.getSize() : f.pos), put = 0;
       for (const s of src) { const k = f.sh!.write(u8().slice(s.ptr, s.ptr + s.len), { at: pos }); pos += k; put += k; }
-      if (put) f.wrote = true;
+      if (put) { f.wrote = true; f.end = Math.max(f.end ?? 0, pos); }
       if (!pw) f.pos = pos;
       dv().setUint32(pw ? n(4) : n(3), put, true); return 0;
     }
@@ -528,8 +678,8 @@ async function op(o: Op, a: bigint[]): Promise<number> {
       if (f.kind === 'dir') { writeFilestat(n(1), inoOf(f.path), FT_DIR, 0, 0); return 0; }
       writeFilestat(n(1), inoOf(f.path), FT_FILE, f.sh!.getSize(), Date.now() / 1000); return 0;
     }
-    case Op.FdFilestatSetSize: { const f = fds.get(n(0)); if (!f) return E.BADF; if (!f.sh) return E.ROFS; f.sh.truncate(n(1)); f.wrote = true; return 0; }
-    case Op.FdAllocate: { const f = fds.get(n(0)); if (!f?.sh) return E.BADF; const need = n(1) + n(2); if (f.sh.getSize() < need) f.sh.truncate(need); return 0; }
+    case Op.FdFilestatSetSize: { const f = fds.get(n(0)); if (!f) return E.BADF; if (!f.sh) return E.ROFS; f.sh.truncate(n(1)); f.wrote = true; f.end = n(1); return 0; }
+    case Op.FdAllocate: { const f = fds.get(n(0)); if (!f?.sh) return E.BADF; const need = n(1) + n(2); if (f.sh.getSize() < need) { f.sh.truncate(need); f.end = need; } return 0; }
     case Op.FdFilestatSetTimes: case Op.PathFilestatSetTimes: return 0;
     case Op.PathFilestatGet: {
       const dir = fds.get(n(0)); if (!dir || dir.kind !== 'dir') return E.BADF;
@@ -561,7 +711,9 @@ async function op(o: Op, a: bigint[]): Promise<number> {
       const dir = fds.get(n(0)); if (!dir || dir.kind !== 'dir') return E.BADF; if (dir.mount === 'data') return E.ROFS;
       const rel = normRel(joinRel(dir.path, readPath(n(1), n(2)))); if (!rel) return E.PERM;
       const e = await saveEntry(rel); if (!e) return E.NOENT; if (e.kind) return E.EXIST;
-      await e.parent.getDirectoryHandle(e.name, { create: true }); return 0;
+      try { await e.parent.getDirectoryHandle(e.name, { create: true }); }
+      catch (err) { return await saveTrouble('a folder of the save folder could not be made', err, again) ? op(o, a, true) : E.IO; }
+      return 0;
     }
     case Op.PathRemoveDirectory: case Op.PathUnlinkFile: {
       const dir = fds.get(n(0)); if (!dir || dir.kind !== 'dir') return E.BADF; if (dir.mount === 'data') return E.ROFS;
@@ -571,6 +723,8 @@ async function op(o: Op, a: bigint[]): Promise<number> {
       if (o === Op.PathRemoveDirectory && e.kind === 'file') return E.NOTDIR;
       for (const [k, f] of fds) if (f.mount === 'save' && f.path === rel && f.sh) { f.sh.close(); fds.delete(k); }
       try { await e.parent.removeEntry(e.name); } catch { return E.NOTEMPTY; }
+      // a profile the game deleted (its own Delete): the page's cloud saves expect one fewer
+      if (o === Op.PathUnlinkFile && isProfilePath(rel.split('/'))) (self as unknown as Worker).postMessage({ t: 'removed', path: rel });
       return 0;
     }
     case Op.PathRename: {
@@ -582,13 +736,20 @@ async function op(o: Op, a: bigint[]): Promise<number> {
       const pb = await saveDirAt(rb.split('/').slice(0, -1), false); if (!pb) return E.NOENT;
       for (const [k, f] of fds) if (f.mount === 'save' && f.path === ra && f.sh) { f.sh.close(); fds.delete(k); }
       const eb = await saveEntry(rb); if (eb?.kind === 'file') await eb.parent.removeEntry(eb.name);
-      await (ea.h as any).move(pb, rb.split('/').pop()); return 0;
+      await (ea.h as any).move(pb, rb.split('/').pop());
+      // a file written under another name and moved into place (the runtime's registry.txt.tmp): saved as that one
+      if (ea.kind === 'file') (self as unknown as Worker).postMessage({ t: 'saved', path: rb });
+      return 0;
     }
     case Op.FdRenumber: { const f = fds.get(n(0)); if (!f) return E.BADF; fds.delete(n(0)); fds.set(n(1), f); return 0; }
     case Op.FdAdvise: return 0;
     case Op.MovieOpen: return movieOpen(n(0), n(1));
     case Op.MovieDecode: return await movieDecode(memory, n(0), n(1), n(2), n(3), n(4), n(5), n(6), n(7), note);
     case Op.MovieClose: movieClose(n(0)); return 0;
+    case Op.Clock:
+      if (n(0) < 0 || n(0) >= MAX_THREADS) return E.INVAL;
+      new Float64Array(rpcI32.buffer)[(n(0) * RPC_SLOT + 128) / 8] = performance.timeOrigin + performance.now();
+      return 0;
   }
   return E.NOSYS;
 }
@@ -601,15 +762,35 @@ async function op(o: Op, a: bigint[]): Promise<number> {
 // on a Mac: about one race in three, up to 50 s).  With a timeout no wait was late in 18 races there (50 and
 // 1000 ms); 50 also bounds one that would be to a few frames.
 const DOORBELL_WAIT_MS = 50;
+// The request each slot has in this worker (op, its fd's file, since when, IO_SLOW_MS steps said): a request that
+// does not come back is written in the log with where it waits (steps), while this worker's loop still runs
+const pending: ({ op: number; what: string; t0: number; said: number } | null)[] = new Array(MAX_THREADS).fill(null);
+function watch() {
+  const now = performance.now(), slow = (x: { t0: number; said: number }) => {
+    if (now - x.t0 < IO_SLOW_MS * 2 ** x.said) return false;
+    x.said++; return true;
+  };
+  for (let s = 0; s < MAX_THREADS; s++) {
+    const r = pending[s];
+    if (!r || !slow(r)) continue;
+    const at = [...steps].filter(([, v]) => now - v.t0 >= IO_SLOW_MS).map(([k, v]) => `${k}: ${v.at} for ${((now - v.t0) / 1000).toFixed(0)} s`);
+    note(`[io] ${opName(r.op)} of ${r.what} unanswered for ${((now - r.t0) / 1000).toFixed(0)} s${at.length ? `; waiting: ${at.slice(0, 4).join('; ')}` : ''}`);
+  }
+}
 async function serve() {
   let seen = Atomics.load(ctl, CTL_IO_DOORBELL);
+  setInterval(watch, 5000);
   for (;;) {
+    Atomics.add(ctl, CTL_IO_BEAT, 1);
     for (let s = 0; s < MAX_THREADS; s++) {
       const b = s * (RPC_SLOT / 4);
       if (Atomics.compareExchange(rpcI32, b, RPC_POSTED, RPC_TAKEN) !== RPC_POSTED) continue;
       const opc = rpcI32[b + 1] as Op, nargs = rpcI32[b + 3], b64 = s * (RPC_SLOT / 8), args: bigint[] = [];
       for (let i = 0; i < nargs; i++) args.push(rpcI64[b64 + 2 + i]);
+      const fd = nargs ? fds.get(Number(args[0])) : undefined;
+      pending[s] = { op: opc, what: fd ? `${fd.preopen ?? `/${fd.mount}`}${fd.preopen ? '' : '/' + fd.path}` : nargs ? `fd ${args[0]}` : '-', t0: performance.now(), said: 0 };
       op(opc, args).catch(e => { console.error('io op', opc, e); return E.IO; }).then(r => {
+        pending[s] = null;
         rpcI32[b + 2] = r; Atomics.store(rpcI32, b, RPC_DONE); Atomics.notify(rpcI32, b);
       });
     }
@@ -619,7 +800,8 @@ async function serve() {
   }
 }
 
-onmessage = async (e: MessageEvent<Init>) => {
+onmessage = async (e: MessageEvent<Init | { t: 'save-ready' }>) => {
+  if ('t' in e.data) { if (e.data.t === 'save-ready') saveAnswered?.(); return; }
   ({ memory, cfg } = e.data);
   ctl = new Int32Array(e.data.ctl); rpcI32 = new Int32Array(e.data.rpc); rpcI64 = new BigInt64Array(e.data.rpc);
   try {

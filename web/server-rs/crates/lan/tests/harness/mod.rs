@@ -42,9 +42,9 @@ pub fn ip_str(v: u32) -> String {
     nfsu2_util::vip_str(v)
 }
 
-/// every address the switch hands out: host bytes 2-251 in each of 10.77.0-23.x (10.77.0.0/19)
+/// every address the switch hands out: host bytes 2-251 in each of 10.77.0-55.x (10.77.0.0/18)
 pub fn all_vips() -> Vec<u32> {
-    (0..24u32).flat_map(|b| (0..250u32).map(move |i| (10 << 24) | (77 << 16) | (b << 8) | (i + 2))).collect()
+    (0..56u32).flat_map(|b| (0..250u32).map(move |i| (10 << 24) | (77 << 16) | (b << 8) | (i + 2))).collect()
 }
 
 /// the tests' options: WebSocket messages of up to 1 MiB taken (max_payload), so that the switch's own limits decide
@@ -140,7 +140,7 @@ async fn serve(lan: Arc<LanSwitch>, mut s: TcpStream) {
     }
     let (mut resume, mut queue) = (false, false);
     let (mut group, mut site) = (None, None);
-    let (mut ident, mut refuse, mut gate) = (None, None, None);
+    let (mut ident, mut refuse, mut gate, mut rename, mut norace) = (None, None, None, None, None);
     for kv in query.split('&').filter(|kv| !kv.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         match k {
@@ -149,17 +149,27 @@ async fn serve(lan: Arc<LanSwitch>, mut s: TcpStream) {
             "g" if group.is_none() => group = Some(v.to_string()),
             "s" if site.is_none() => site = Some(v.to_string()),
             // the server's bans: its id for the client's address, a client it turns away at once, a page id or a
-            // keyphrase's owner it turns away at the hello (with {"t":"ban","msg":<what matched>,"ids":[...]})
+            // keyphrase's owner it turns away at the hello (with {"t":"ban","msg":<what matched>,"ids":[...]}), a
+            // name it takes away ({"t":"rename","name":...}), a page id it keeps out of races ({"t":"races"})
             "ident" => ident = Some(v.to_string()),
             "refuse" => refuse = Some(Bytes::from(json!({ "t": "ban", "msg": v }).to_string())),
             "gate" => gate = Some(v.to_string()),
+            "rename" => rename = Some(v.to_string()),
+            "norace" => norace = Some(v.to_string()),
             _ => {}
         }
     }
-    let on_hello: Option<nfsu2_lan::OnHello> = gate.map(|g| {
+    let on_hello: Option<nfsu2_lan::OnHello> = (gate.is_some() || rename.is_some() || norace.is_some()).then(|| {
         Box::new(move |h: &nfsu2_lan::Hello| {
-            let hit = h.ids.iter().copied().chain(h.owner).find(|x| *x == g)?;
-            Some(Bytes::from(json!({ "t": "ban", "msg": hit, "ids": h.ids }).to_string()))
+            let mut a = nfsu2_lan::HelloAnswer::default();
+            if let Some(hit) = gate.as_deref().and_then(|g| h.ids.iter().copied().chain(h.owner).find(|x| *x == g)) {
+                a.refuse = Some((Bytes::from(json!({ "t": "ban", "msg": hit, "ids": h.ids }).to_string()), nfsu2_lan::CLOSE_BANNED));
+            } else if rename.as_deref() == Some(h.name) {
+                a.refuse = Some((Bytes::from(json!({ "t": "rename", "name": h.name }).to_string()), nfsu2_lan::CLOSE_RENAME));
+            } else if norace.as_deref().is_some_and(|n| h.ids.contains(&n)) {
+                a.no_races = Some(Bytes::from(json!({ "t": "races", "msg": "no" }).to_string()));
+            }
+            a
         }) as nfsu2_lan::OnHello
     });
     // a keyphrase's owner: "owner-" and its token (the server's is a hash: nfsu2-claims)
@@ -321,7 +331,7 @@ enum Cmd {
 
 #[derive(Default, Clone, Copy)]
 pub struct Opts {
-    pub deltas: bool,
+    /// LAN play in its hello: 0 or 1 (None: 1, the LAN screens open, so that it hears every player and broadcast)
     pub lan: Option<u8>,
     pub bundle: bool,
     /// and compact bundles (kind 33): its frames come as they are in `frames`, `unpack_compact` takes them apart
@@ -334,10 +344,6 @@ pub struct Opts {
     pub block: Option<&'static [&'static str]>,
 }
 
-pub fn deltas() -> Opts {
-    Opts { deltas: true, ..Opts::default() }
-}
-
 pub fn lan(on: u8) -> Opts {
     Opts { lan: Some(on), ..Opts::default() }
 }
@@ -347,8 +353,8 @@ pub fn bundles() -> Opts {
 }
 
 /// A fake browser: collects control messages and frames; `resume` = (vip, token): reconnects as the page does
-/// (/lan?resume, then a hello with the old address and the token before anything else); its hello says deltas,
-/// lan and bundle as `Opts` say.
+/// (/lan?resume, then a hello with the old address and the token before anything else); its hello says lan and
+/// bundle as `Opts` say.
 pub struct Client {
     pub name: String,
     pub vip: u32,
@@ -372,12 +378,7 @@ impl Client {
 
     pub async fn new(port: u16, name: &str, query: &str, resume: Option<(u32, &str)>, o: Opts) -> Client {
         let mut extra = Map::new();
-        if o.deltas {
-            extra.insert("deltas".into(), 1.into());
-        }
-        if let Some(l) = o.lan {
-            extra.insert("lan".into(), l.into());
-        }
+        extra.insert("lan".into(), o.lan.unwrap_or(1).into());
         if o.bundle {
             extra.insert("bundle".into(), 1.into());
         }
@@ -661,6 +662,19 @@ pub fn frame(op: u8, payload: &[u8]) -> Vec<u8> {
 
 pub const PING: u8 = 0x9;
 pub const PONG: u8 = 0xA;
+
+/// a client that never reads, with its hello sent, on an in-memory pipe that holds `cap` bytes instead of a socket:
+/// the switch's writer to it stops once they are written, on every system (a loopback socket's buffers are the
+/// kernel's to size; macOS's took a whole burst, and the switch's queue a test measures stayed empty).  Keep the
+/// returned end: dropping it closes the connection; what is written to it reaches the switch as the client's
+/// frames.  `group`: as ?g=<id> names it.
+pub fn stalled_peer(sw: &Switch, name: &str, group: Option<&str>, cap: usize) -> tokio::io::DuplexStream {
+    let (ours, theirs) = tokio::io::duplex(cap);
+    let (r, w) = tokio::io::split(theirs);
+    let hello = frame(0x1, json!({ "t": "hello", "name": name }).to_string().as_bytes());
+    sw.lan.attach(r, w, Bytes::from(hello), AttachOpts { group: group.map(str::to_string), ..AttachOpts::default() });
+    ours
+}
 
 /// a client on a plain socket that reads only when told to (a slow or stalled receiver), with its hello sent
 pub async fn raw_peer(port: u16, name: &str, query: &str) -> TcpStream {

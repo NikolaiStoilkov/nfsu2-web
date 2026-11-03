@@ -271,6 +271,23 @@ async fn the_binary_starts_counts_its_players_and_stops() {
         Some(0o700),
         "the kept blocks' folder is private"
     );
+    // the log files: the console in today's file too, each line after its time; private
+    assert!(
+        rust.startup.contains(&"  logs      : the console in <state>/logs too, a file a day (UTC), gzipped once it ended, the last 30 days".to_string()),
+        "{:?}",
+        rust.startup
+    );
+    let today = &nfsu2_util::js::iso_string(nfsu2_util::now_ms())[..10];
+    let file = state.join("logs").join(format!("{today}.log"));
+    let kept = std::fs::read_to_string(&file).unwrap_or_default();
+    let line_of = |want: &str| kept.lines().find(|l| l.get(25..) == Some(want)).map(|l| l[..24].to_string());
+    let at = line_of("NFSU2 web server").expect("the start in the log file");
+    assert!(at.starts_with(today) && at.ends_with('Z') && at.as_bytes()[10] == b'T', "{at}");
+    assert!(line_of("[lan] 10.77.0.2 \"Ann\" left (0 on the switch)").is_some(), "{kept}");
+    assert!(kept.lines().count() >= rust.console.len() + rust.startup.len(), "every console line: {kept}");
+    for (p, mode) in [(state.join("logs"), 0o700), (file, 0o600)] {
+        assert_eq!(std::fs::metadata(&p).map(|m| m.permissions().mode() & 0o777).ok(), Some(mode), "{}", p.display());
+    }
 }
 
 /// a header of an answer's head (its name in any case)
@@ -406,6 +423,12 @@ async fn the_lobby_trace_of_a_login() {
     let mut srv = Server::spawn(command(&data, &wasm, port, &state, &["--dev", "--online-trace", trace.to_str().unwrap()]), port);
     srv.ready().await;
     assert!(srv.lines().iter().any(|l| l.starts_with("  trace     : lobby messages (secrets redacted) into ")));
+    // no kept blocks on a --dev server: a test's fresh state folder would compress the whole game for most of an hour
+    assert!(
+        srv.lines().iter().any(|l| l == "  blocks    : compressed as they are sent (NFSU2_COMPRESS_THREADS=0, --dev's default)"),
+        "{:?}",
+        srv.lines()
+    );
     let a = Browser::open_at(&format!("localhost:{port}"), port, "", None).await;
     a.hello("Ann");
     let c = a.login("Ann").await;
@@ -641,7 +664,7 @@ async fn messages_in_the_same_write_as_the_handshake_are_not_lost() {
     let (port, state) = (free_port(), tmp.path().join("state"));
     let mut srv = Server::spawn(command(&data, &wasm, port, &state, &[]), port);
     srv.ready().await;
-    let hello = client_frame(1, br#"{"t":"hello","name":"Early","deltas":1}"#);
+    let hello = client_frame(1, br#"{"t":"hello","name":"Early","lan":1}"#);
     let got = pipelined(port, "", &hello, r#""name":"Early""#).await;
     let welcome: Value = serde_json::from_str(got.iter().find(|m| m.contains("welcome")).expect("a welcome")).unwrap();
     assert!(got.iter().any(|m| m.contains(r#""t":"peers""#) && m.contains(r#""name":"Early""#)), "the hello named it: {got:?}");
@@ -720,6 +743,45 @@ fn ctl(state: &Path, words: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), text)
 }
 
+// A page that goes by "player" on the switch while its game shows another name over its car (an edited page): the
+// console says so with its address, `who` finds it by either name and shows both, and `ban` takes it by the game's
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn who_finds_a_player_by_the_name_over_its_car() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (data, wasm) = game_folder(tmp.path());
+    let (port, state) = (free_port(), tmp.path().join("state"));
+    let mut srv = Server::spawn(command(&data, &wasm, port, &state, &["--online", "off"]), port);
+    srv.ready().await;
+    let host = format!("localhost:{port}");
+    let a = Browser::open_from(&host, port, "", None, None, Some("192.0.2.1")).await;
+    let b = Browser::open_from(&host, port, "", None, None, Some("192.0.2.2")).await;
+    a.text(&serde_json::json!({ "t": "hello", "name": "player", "id": "page-a" }).to_string());
+    b.hello("Bob");
+    a.binary(to_hub(&roam_hello_named(501, b"Mallory")));
+    b.binary(to_hub(&roam_hello_named(502, b"bob")));
+    let a_vip = nfsu2_util::vip_str(a.vip);
+    let t0 = Instant::now();
+    let mut who = ctl(&state, &["who", "llor"]);
+    while !who.1.starts_with("1 on the switch") && t0.elapsed() < Duration::from_secs(3) {
+        sleep(50).await;
+        who = ctl(&state, &["who", "llor"]);
+    }
+    assert_eq!(who.0, 0, "{}", who.1);
+    let head = format!("1 on the switch called *llor*\n{a_vip:<13}\"player\"                 free roam, ");
+    assert!(who.1.starts_with(&head) && who.1.ends_with(" min; its game shows \"Mallory\""), "{}", who.1);
+    let all = ctl(&state, &["who"]).1;
+    assert!(all.contains("\"Bob\"") && !all.contains("its game shows \"bob\""), "Bob's page and game have one name: {all}");
+    let line = format!("[roam] {a_vip} \"player\": its game shows \"Mallory\" over its car");
+    assert!(srv.lines().iter().any(|l| l.ends_with(&line)), "{:?}", srv.lines());
+    let ban = ctl(&state, &["ban", "mallory", "perm"]);
+    assert_eq!(ban.0, 0, "{}", ban.1);
+    assert!(ban.1.starts_with("ban #1: \"Mallory\" for good, by its page and its address\n"), "{}", ban.1);
+    assert!(ban.1.ends_with(&format!("removed {a_vip} \"player\"")), "{}", ban.1);
+    assert_eq!(a.until_ms(3000, |g| g.closed.clone()).await, (4003, "banned".into()));
+    assert!(b.is_open(), "Bob plays on");
+    assert_eq!(srv.stop().await, Some(0));
+}
+
 /// a page from `xff` (its address, as a proxy on this machine names it) that says hello with page id `id`: what it
 /// got by the time the switch closed it (or 2 s), and how
 async fn turned_away(host: &str, port: u16, xff: &str, id: &str) -> (Vec<Value>, Option<(u16, String)>) {
@@ -768,14 +830,15 @@ async fn kicks_and_bans_through_the_control_socket() {
     // a [cheat] line's mark from before this start (the server's Marker makes them from the hosts' lines)
     std::fs::create_dir_all(&state).unwrap();
     let marks = nfsu2_bans::Bans::open(&state).unwrap();
-    assert_eq!(marks.mark("Racer", marks.keys(None, Some("page-racer"), None), nfsu2_util::now_ms()).unwrap(), "c1");
+    assert_eq!(marks.mark("Racer", marks.keys(None, Some("page-racer"), None), nfsu2_util::now_ms()).unwrap().handle, "c1");
     drop(marks);
     let mut srv = Server::spawn(command(&data, &wasm, port, &state, &["--online", "off", "--roam-hub", "off"]), port);
     srv.ready().await;
     let host = format!("localhost:{port}");
     let sock = state.join("control.sock").to_string_lossy().to_string();
     assert!(
-        srv.lines().contains(&format!("  bans      : 0; nfsu2-server ctl who, kick, ban, unban, bans (through {sock})")),
+        srv.lines()
+            .contains(&format!("  bans      : 0; nfsu2-server ctl who, kick, ban, raceban, rename, unban, bans, history (through {sock})")),
         "{:?}",
         srv.lines()
     );
@@ -913,6 +976,106 @@ async fn kicks_and_bans_through_the_control_socket() {
     assert!(!lines.iter().any(|l| l.contains("192.0.2")), "no client address in the log: {lines:?}");
 }
 
+// A race ban keeps its player on the switch, out of races: its page hears why at once and at each hello, and that it
+// races again when the ban is lifted; `change` makes it a full ban and back.  A rename takes the name away from
+// everyone: the player's page is asked for another, a hello under it (or under one that reads the same) is too, one
+// under another name plays on.  `history` says what each player had, and a new ban's reply what it had before
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn race_bans_renames_and_history_through_the_control_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (data, wasm) = game_folder(tmp.path());
+    let (port, state) = (free_port(), tmp.path().join("state"));
+    let mut srv = Server::spawn(command(&data, &wasm, port, &state, &["--online", "off", "--roam-hub", "off"]), port);
+    srv.ready().await;
+    let host = format!("localhost:{port}");
+    let hello = |name: &str, id: &str| serde_json::json!({ "t": "hello", "name": name, "id": id }).to_string();
+    let open = |xff: &'static str, name: &'static str, id: &'static str| {
+        let (host, hello) = (host.clone(), hello(name, id));
+        async move {
+            let b = Browser::open_from(&host, port, "", None, None, Some(xff)).await;
+            b.text(&hello);
+            b
+        }
+    };
+    let cat = open("192.0.2.1", "Cat", "page-cat").await;
+    let dan = open("192.0.2.2", "B4dName", "page-dan").await;
+    let t0 = Instant::now();
+    while !ctl(&state, &["who"]).1.contains("\"B4dName\"") && t0.elapsed() < Duration::from_secs(3) {
+        sleep(50).await;
+    }
+    let races = |g: &Got| g.ctl.iter().rev().find(|m| m["t"] == "races").cloned();
+
+    // a race ban: Cat stays, out of races, and hears why; again in another tab
+    let cat_vip = nfsu2_util::vip_str(cat.vip);
+    let rb = ctl(&state, &["raceban", "cat", "2w", "Cheating", "in", "races"]);
+    assert_eq!(rb.0, 0, "{}", rb.1);
+    assert!(rb.1.starts_with("race ban #1: \"Cat\" for 14 d (until "), "{}", rb.1);
+    assert!(rb.1.ends_with(&format!("by its page and its address\nout of races now: {cat_vip} \"Cat\"")), "{}", rb.1);
+    assert_eq!(cat.until_ms(3000, races).await["msg"], "Cheating in races");
+    let tab = open("192.0.2.1", "Cat", "page-cat").await;
+    assert_eq!(tab.until_ms(3000, races).await["msg"], "Cheating in races");
+    sleep(200).await;
+    assert!(cat.is_open() && tab.is_open(), "a race ban removes nobody");
+    assert!(ctl(&state, &["bans"]).1.contains("race ban until "), "{}", ctl(&state, &["bans"]).1);
+    // made a full ban: removed; a race ban for a week again
+    let ch = ctl(&state, &["change", "#1", "full"]);
+    assert!(ch.1.starts_with("#1 \"Cat\": ban for 14 d (until "), "{}", ch.1);
+    assert_eq!(cat.until_ms(3000, |g| g.closed.clone()).await, (4003, "banned".into()));
+    let ch = ctl(&state, &["change", "#1", "1w", "races"]);
+    assert!(ch.1.starts_with("#1 \"Cat\": race ban for 7 d (until "), "{}", ch.1);
+    // lifted: the one on the switch races again
+    let cat = open("192.0.2.1", "Cat", "page-cat").await;
+    assert_eq!(cat.until_ms(3000, races).await["until"].is_i64(), true);
+    let cat_vip = nfsu2_util::vip_str(cat.vip);
+    assert_eq!(ctl(&state, &["unban", "#1"]), (0, format!("lifted #1 \"Cat\" (race ban); races again: {cat_vip} \"Cat\"")));
+    assert_eq!(cat.until_ms(3000, |g| races(g).filter(|m| m["lifted"] == true)).await["lifted"], true);
+
+    // a rename: Dan's page is asked for another name
+    let rn = ctl(&state, &["rename", "b4dname", "Offensive", "name"]);
+    assert_eq!(rn.0, 0, "{}", rn.1);
+    assert!(rn.1.starts_with("rename #2: \"B4dName\" taken away from everyone, and the names that read the same"), "{}", rn.1);
+    assert_eq!(dan.until_ms(3000, |g| g.closed.clone()).await, (4004, "rename".into()));
+    let told = dan.got().ctl.iter().find(|m| m["t"] == "rename").cloned().expect("the rename's message");
+    assert_eq!((told["name"].clone(), told["msg"].clone()), (Value::from("B4dName"), Value::from("Offensive name")));
+    // a hello under a name that reads the same: asked too; under another, Dan plays on
+    let (got, closed) =
+        turned_away_hello(&host, port, "192.0.2.3", serde_json::json!({ "t": "hello", "name": "BadName", "id": "page-eve" })).await;
+    assert_eq!((kinds(&got).last().cloned(), closed), (Some("rename".to_string()), Some((4004, "rename".to_string()))));
+    assert_eq!(got.last().map(|m| m["msg"].clone()), Some(Value::from("Offensive name")));
+    let dan = open("192.0.2.2", "Dan", "page-dan").await;
+    sleep(200).await;
+    assert!(dan.is_open());
+    assert!(ctl(&state, &["names"]).1.starts_with("\"B4dName\""), "{}", ctl(&state, &["names"]).1);
+
+    // the history: Dan's under its new name (by its page), Cat's by its ban's number
+    let h = ctl(&state, &["history", "dan"]);
+    assert!(h.1.starts_with("\"Dan\": 1 in the last year\n#2 rename \"B4dName\", on "), "{}", h.1);
+    let h = ctl(&state, &["history", "#1"]);
+    assert!(h.1.contains("#1 race ban \"Cat\", 7 d from ") && h.1.contains(", lifted "), "{}", h.1);
+    assert!(ctl(&state, &["history", "Nobody"]).1.ends_with("no bans or renames in the last year"));
+    // a new ban says what the player had before
+    let rb = ctl(&state, &["raceban", "cat", "perm"]);
+    assert!(rb.1.contains("\nbefore: 1 (history lists them)\n  #1 race ban \"Cat\""), "{}", rb.1);
+    // the name given back
+    assert_eq!(ctl(&state, &["unname", "badname"]), (0, "gave back \"B4dName\": anyone may play under it again".into()));
+    assert_eq!(ctl(&state, &["names"]), (0, "no names taken away".into()));
+
+    assert_eq!(srv.stop().await, Some(0));
+    let lines = srv.lines();
+    for start in [
+        "[ban] race ban #1 \"Cat\" for 14 d (until ",
+        "[ban] a client of race ban #1 \"Cat\" plays on, out of races",
+        "[ban] changed #1 \"Cat\": ban for 14 d",
+        "[ban] lifted #1 \"Cat\" (race ban); races again: ",
+        "[ban] rename #2 \"B4dName\": \"B4dName\": \"Offensive name\"; asked for another name: ",
+        "[ban] asked a client under \"BadName\" for another name (\"B4dName\": rename #2)",
+        "[ban] gave back \"B4dName\"",
+    ] {
+        assert!(lines.iter().any(|l| l.starts_with(start)), "{start}: {lines:?}");
+    }
+    assert!(!lines.iter().any(|l| l.contains("192.0.2")), "no client address in the log: {lines:?}");
+}
+
 // The control socket's file (app/control.rs): a stale one, as a server that died without its stop leaves it, is
 // replaced at the start; a SIGTERM takes it away.  Of two servers on one state folder (the next one started before
 // the one before stops), the later one's socket stays when the earlier one stops.
@@ -946,4 +1109,236 @@ async fn the_control_socket_goes_with_its_server() {
     assert_eq!(ctl(&state, &["bans"]), (0, "no bans".into()), "and answers");
     assert_eq!(b.stop().await, Some(0));
     assert!(std::fs::symlink_metadata(&sock).is_err(), "gone with the later server");
+}
+
+/// one HTTP request (Host: localhost), its status and body
+async fn http(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut q = format!("{method} {path} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
+    for (k, v) in headers {
+        q.push_str(&format!("{k}: {v}\r\n"));
+    }
+    q.push_str("\r\n");
+    q.push_str(body);
+    s.write_all(q.as_bytes()).await.unwrap();
+    let mut r = Vec::new();
+    s.read_to_end(&mut r).await.unwrap();
+    let r = String::from_utf8_lossy(&r).to_string();
+    let code = r.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
+    (code, r.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
+}
+
+/// a page's friend messages from the server, past the first `from` of them (free roam's friends: src/app/friends.rs)
+fn friend_msgs(g: &Got, from: usize) -> Vec<Value> {
+    g.ctl.iter().filter(|m| m["t"] == "friend").skip(from).cloned().collect()
+}
+
+// Free roam's friends through the whole server (src/app/friends.rs): pages whose players the hub linked ask about each
+// other and befriend each other with their messages on /lan, each hears of the other's request and of the friendship;
+// /friends shows the lists to the start page (where each friend plays) and takes its answers, a removal, a block;
+// what is no claimed name, not linked, or not this server's own page takes no part; friends message each other (to
+// the open page at once, else it waits and the start page takes it with the lists; a stranger's, an empty one, past
+// the limit: not); and the friends are kept over a restart (the friends lists' shelf, nfsu2-online buddy.rs)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn free_roams_friends_through_the_server() {
+    use nfsu2_claims::{Claims, owner_of_token};
+    let tmp = tempfile::tempdir().unwrap();
+    let (data, wasm) = game_folder(tmp.path());
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let tok = |c: char| c.to_string().repeat(43);
+    let now = nfsu2_util::now_ms();
+    let claims = Claims::open(&state, now);
+    for (n, c) in [("Al", 'A'), ("Bo", 'B'), ("Cy", 'C')] {
+        claims.claim(n, &owner_of_token(&tok(c)).unwrap(), now).unwrap();
+    }
+    claims.save(now).unwrap();
+    let port = free_port();
+    let mut srv = Server::spawn(command(&data, &wasm, port, &state, &["--vault-gb", "1"]), port);
+    srv.ready().await;
+    let bearer = |c: char| format!("Bearer {}", tok(c));
+    let lists = |c: char| {
+        let b = bearer(c);
+        async move {
+            let (code, body) = http(port, "GET", "/friends", &[("authorization", &b), ("sec-fetch-site", "same-origin")], "").await;
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        }
+    };
+    // the start page: its own lists; no keyphrase, another site, a keyphrase without a name
+    assert_eq!(lists('A').await, serde_json::json!({ "me": "Al_", "done": "ok", "friends": [], "asks": [], "sent": [], "mail": [] }));
+    assert_eq!(http(port, "GET", "/friends", &[], "").await.0, 401);
+    assert_eq!(http(port, "GET", "/friends", &[("authorization", &bearer('A')), ("sec-fetch-site", "cross-site")], "").await.0, 403);
+    assert_eq!(http(port, "GET", "/friends", &[("authorization", &bearer('A')), ("origin", "https://evil.example")], "").await.0, 403);
+    assert_eq!(lists('D').await["me"], Value::Null);
+    // in free roam: Al and Bo 4 m apart, Cy 2 km off, Dee (no keyphrase) beside Al
+    let host = format!("localhost:{port}");
+    let page = |name: &'static str, key: Option<char>, id: u32, x: f32| {
+        let host = host.clone();
+        async move {
+            let b = Browser::open_at(&host, port, "", None).await;
+            let mut h = serde_json::json!({ "t": "hello", "name": name });
+            if let Some(k) = key {
+                h["claim"] = tok(k).into();
+            }
+            b.text(&h.to_string());
+            b.binary(to_hub(&roam_hello_named(id, name.as_bytes())));
+            b.binary(to_hub(&roam_snap(id, [x, 0.0, 0.0])));
+            b
+        }
+    };
+    let al = page("Al", Some('A'), 701, 0.0).await;
+    let bo = page("Bo", Some('B'), 702, 4.0).await;
+    let cy = page("Cy", Some('C'), 703, 2000.0).await;
+    let dee = page("Dee", None, 704, -4.0).await;
+    for x in [&al, &bo, &cy, &dee] {
+        x.text(r#"{"t":"friend","op":"list"}"#);
+    }
+    let n = |b: &Browser| friend_msgs(&b.got(), 0).len();
+    async fn first(b: &Browser, op: &'static str, from: usize) -> Value {
+        b.until_ms(4000, move |g| friend_msgs(g, from).into_iter().find(|m| m["op"] == op)).await
+    }
+    assert_eq!(first(&al, "list", 0).await["me"], "Al_");
+    assert_eq!(first(&dee, "list", 0).await["me"], Value::Null);
+    // (the hub's ticks: linked)
+    sleep(1500).await;
+    let ask = |b: &Browser, op: &str, name: &str| b.text(&serde_json::json!({ "t": "friend", "op": op, "name": name }).to_string());
+    let (na, nb) = (n(&al), n(&bo));
+    ask(&al, "can", "Bo");
+    let c = first(&al, "can", na).await;
+    assert_eq!((c["name"].as_str(), c["st"].as_str()), (Some("Bo_"), Some("new")), "{c}");
+    for (who, st) in [("Cy", "far"), ("Dee", "theirs"), ("Nobody", "far")] {
+        let k = n(&al);
+        ask(&al, "can", who);
+        assert_eq!(first(&al, "can", k).await["st"], st, "{who}");
+    }
+    let k = n(&dee);
+    ask(&dee, "can", "Al");
+    assert_eq!(first(&dee, "can", k).await["st"], "claim", "Dee has no claimed name");
+    let k = n(&al);
+    ask(&al, "add", "Cy");
+    assert_eq!(first(&al, "add", k).await["done"], "far", "a request to a player it is not linked with");
+    // Al asks: Bo hears of it; the start pages see the request each way
+    let k = n(&al);
+    ask(&al, "add", "Bo");
+    assert_eq!(first(&al, "add", k).await["done"], "asked");
+    assert_eq!(first(&bo, "asks", nb).await["name"], "Al_");
+    assert_eq!(lists('A').await["sent"], serde_json::json!(["Bo_"]));
+    assert_eq!(lists('B').await["asks"], serde_json::json!(["Al_"]));
+    // Bo asks back: friends, both told, their lists again (and the hub has them)
+    let (ka, kb) = (n(&al), n(&bo));
+    ask(&bo, "add", "Al");
+    assert_eq!(first(&bo, "add", kb).await["done"], "friends");
+    assert_eq!(first(&al, "friends", ka).await["name"], "Bo_");
+    assert_eq!(first(&al, "list", ka).await["friends"], serde_json::json!(["Bo_"]));
+    assert_eq!(first(&bo, "list", kb).await["friends"], serde_json::json!(["Al_"]));
+    let k = n(&al);
+    ask(&al, "can", "Bo");
+    assert_eq!(first(&al, "can", k).await["st"], "friends");
+    // messages: to Bo's open page at once; to a stranger, an empty one, then past the limit (3 at once) not
+    let say = |b: &Browser, name: &str, body: &str, id: u32| {
+        b.text(&serde_json::json!({ "t": "friend", "op": "msg", "name": name, "body": body, "id": id }).to_string())
+    };
+    async fn done(b: &Browser, id: u32, from: usize) -> Value {
+        b.until_ms(4000, move |g| friend_msgs(g, from).into_iter().find(|m| m["op"] == "msg" && m["id"] == id)).await
+    }
+    let (ka, kb) = (n(&al), n(&bo));
+    say(&al, "Bo_", "meet me at the airport", 1);
+    assert_eq!(done(&al, 1, ka).await["done"], "sent");
+    let m = first(&bo, "mail", kb).await;
+    assert_eq!((m["from"].as_str(), m["body"].as_str()), (Some("Al_"), Some("meet me at the airport")), "{m}");
+    // (one at a time: each is handled on its own task)
+    say(&al, "Cy_", "hi", 2);
+    assert_eq!(done(&al, 2, ka).await["done"], "none", "not friends");
+    say(&al, "Bo_", "   ", 3);
+    assert_eq!(done(&al, 3, ka).await["done"], "empty");
+    say(&al, "Bo_", "one more", 4);
+    assert_eq!(done(&al, 4, ka).await["done"], "rate", "3 at once, then one every 2 s");
+    let k = n(&dee);
+    say(&dee, "Al_", "hi", 5);
+    assert_eq!(done(&dee, 5, k).await["done"], "claim", "Dee has no claimed name");
+    // the start page: Bo plays in free roam, in the room of everyone; then Bo leaves
+    assert_eq!(lists('A').await["friends"], serde_json::json!([{ "name": "Bo_", "where": "roam", "room": "" }]));
+    // ...and the game's page on its link (its notices, the page menu's Friends)
+    let k = n(&al);
+    al.text(r#"{"t":"friend","op":"where"}"#);
+    assert_eq!(first(&al, "where", k).await["friends"], serde_json::json!([{ "name": "Bo_", "where": "roam", "room": "" }]));
+    bo.close().await;
+    sleep(1200).await;
+    assert_eq!(lists('A').await["friends"], serde_json::json!([{ "name": "Bo_", "where": "" }]));
+    // Bo away: Al's message waits; Bo's start page takes it with the lists (once), and answers to Al's open page
+    sleep(1000).await;
+    let ka = n(&al);
+    say(&al, "Bo_", "race later?", 6);
+    assert_eq!(done(&al, 6, ka).await["done"], "kept");
+    let mail = lists('B').await["mail"].clone();
+    assert_eq!((mail[0]["from"].as_str(), mail[0]["body"].as_str(), mail.as_array().map(Vec::len)), (Some("Al_"), Some("race later?"), Some(1)), "{mail}");
+    assert_eq!(lists('B').await["mail"], serde_json::json!([]));
+    // the start page's answers: a removal (friends no more, on both lists), a block, an op that is none
+    let post = |c: char, op: &str, name: &str| {
+        let (b, body) = (bearer(c), serde_json::json!({ "op": op, "name": name }).to_string());
+        async move {
+            let (code, r) = http(port, "POST", "/friends", &[("authorization", &b), ("content-type", "application/json")], &body).await;
+            assert_eq!(code, 200, "{r}");
+            serde_json::from_str::<Value>(&r).unwrap()
+        }
+    };
+    let ka = n(&al);
+    let r = http(port, "POST", "/friends", &[("authorization", &bearer('B')), ("content-type", "application/json")], r#"{"op":"msg","name":"Al_","body":"sure"}"#).await;
+    assert_eq!((r.0, serde_json::from_str::<Value>(&r.1).unwrap()["done"].clone()), (200, Value::from("sent")), "{}", r.1);
+    assert_eq!(first(&al, "mail", ka).await["body"], "sure");
+    assert_eq!(post('B', "remove", "Al_").await["done"], "ok");
+    assert_eq!(lists('A').await["friends"], serde_json::json!([]));
+    assert_eq!(post('A', "remove", "Bo_").await["done"], "none");
+    // a request by name from the start page: the name as typed, the claim's spelling; Cy's open page hears of it
+    let kc = n(&cy);
+    let r = post('A', "ask", "cy").await;
+    assert_eq!((r["done"].as_str(), r["sent"].clone()), (Some("asked"), serde_json::json!(["Cy_"])), "{r}");
+    assert_eq!(first(&cy, "asks", kc).await["name"], "Al_");
+    assert_eq!(post('A', "ask", "Nobody").await["done"], "claim", "a name nobody claimed");
+    assert_eq!(post('A', "ask", "al").await["done"], "self");
+    assert_eq!(http(port, "POST", "/friends", &[("authorization", &bearer('A'))], r#"{"op":"befriend","name":"Bo"}"#).await.0, 400, "no such op");
+    assert_eq!(post('A', "block", "Cy").await["done"], "name", "a name as the lists have it: its Online form");
+    assert_eq!(post('A', "block", "Cy_").await["done"], "ok");
+    // befriended again in free roam, then a restart: kept
+    let bo = page("Bo", Some('B'), 705, 4.0).await;
+    bo.text(r#"{"t":"friend","op":"list"}"#);
+    sleep(1500).await;
+    let kb = n(&bo);
+    ask(&al, "add", "Bo");
+    ask(&bo, "add", "Al");
+    let _ = bo.until_ms(4000, move |g| friend_msgs(g, kb).into_iter().find(|m| m["op"] == "list" && m["friends"] == serde_json::json!(["Al_"]))).await;
+    for x in [al, bo, cy, dee] {
+        x.close().await;
+    }
+    assert_eq!(srv.stop().await, Some(0));
+    let lines = srv.lines();
+    for l in [
+        "\"Al_\" asked \"Bo_\" to be friends (free roam)",
+        "\"Bo_\" and \"Al_\" are friends (asked back in free roam)",
+        "\"Al_\" sent \"Bo_\" a message (got it)",
+        "\"Al_\" sent \"Bo_\" a message (away, it waits)",
+        "\"Al_\" asked \"Cy_\" to be friends (the start page)",
+    ] {
+        assert!(lines.iter().any(|x| x.contains(l)), "{l}: {lines:?}");
+    }
+    let mut srv = Server::spawn(command(&data, &wasm, port, &state, &["--vault-gb", "1"]), port);
+    srv.ready().await;
+    assert_eq!(lists('A').await["friends"], serde_json::json!([{ "name": "Bo_", "where": "" }]), "over the restart");
+    // the limits: a page's friend messages (10, then one every 2 s), a client's reads of /friends (60, then one a second)
+    let al = page("Al", Some('A'), 706, 0.0).await;
+    sleep(300).await;
+    for _ in 0..30 {
+        ask(&al, "can", "Bo");
+    }
+    sleep(1500).await;
+    let answered = friend_msgs(&al.got(), 0).iter().filter(|m| m["op"] == "can").count();
+    assert!((9..=11).contains(&answered), "{answered} of 30 asked at once answered");
+    let mut codes = Vec::new();
+    for _ in 0..70 {
+        codes.push(http(port, "GET", "/friends", &[("authorization", &bearer('A'))], "").await.0);
+    }
+    assert!(codes.iter().filter(|&&c| c == 429).count() >= 5 && codes[0] == 200, "{codes:?}");
+    al.close().await;
+    assert_eq!(srv.stop().await, Some(0));
 }

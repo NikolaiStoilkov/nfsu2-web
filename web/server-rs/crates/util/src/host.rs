@@ -15,7 +15,7 @@
 //! asks [`Charge::overspent`]: the sender spent more than its budgets, and the host closes the stream the frame came
 //! on (nfsu2-online's `overrun`).  The free-roam hub's frames are charged to nobody (`cause: None`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
@@ -63,6 +63,8 @@ pub struct FrameCtx {
     /// the keyphrase its page plays with, as the server knows it (nfsu2-claims: an owner of claimed names), from the
     /// hello's "claim"; None: none
     pub owner: Option<Arc<str>>,
+    /// its player races nobody (the operator's race ban, nfsu2-bans): the Online lobby gives it no game
+    pub no_races: bool,
 }
 
 /// The frames a host has been posted and not handled yet.  Node's hosts could never fall behind: they ran inside the
@@ -149,6 +151,23 @@ pub trait Host: Send + Sync + 'static {
     /// the names browser `vip`'s page blocks (its hello's "block"): the free-roam hub links none of those players with
     /// it, either way; the others take no notice
     fn blocks(&self, _vip: u32, _names: Vec<String>) {}
+    /// browser `vip`'s page goes by `name` on the switch (its hello's): the free-roam hub says so on the console when
+    /// that browser's game shows another name over its car; the others take no notice
+    fn page_name(&self, _vip: u32, _name: &str) {}
+    /// the names browsers' games show other players that are not their pages' on the switch (`page_name`), by
+    /// browser, for the operator's `who`: the free-roam hub's; the others have none
+    fn other_names(&self) -> oneshot::Receiver<HashMap<u32, Vec<String>>> {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(HashMap::new());
+        rx
+    }
+    /// each pair of browsers whose players this host links now, once (the lower address first), for the server's
+    /// counts of the players' paths (nfsu2-lan paths.rs): the free-roam hub's links; the others have none
+    fn link_pairs(&self) -> oneshot::Receiver<Vec<(u32, u32)>> {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Vec::new());
+        rx
+    }
     /// the server stops: save what is kept, end the timers
     fn stop(&self);
 }

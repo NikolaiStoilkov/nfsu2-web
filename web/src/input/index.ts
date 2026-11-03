@@ -5,10 +5,12 @@
 //        layout independent) and its Windows virtual-key code; e.key gives
 //        the characters the layout typed (WM_CHAR, cp1252).  The C side
 //        applies keyboard_mac.m's delivery rules (Alt and SYS messages,
-//        autorepeat, keys whose release was lost).  Every key the game uses
-//        has its browser default prevented; Meta combinations stay the
-//        browser's, and Meta going down releases every held key because
-//        macOS browsers send no keyup for keys released while Cmd is held.
+//        autorepeat, keys whose release was lost, keys held through a
+//        release, which their next autorepeat presses again).  Every key
+//        the game uses has its browser default prevented; Meta combinations
+//        stay the browser's, and Meta going down releases every held key
+//        because macOS browsers send no keyup for keys released while Cmd
+//        is held.
 // Mouse: positions relative to the shown image (the C side maps them into
 //        the game's client area and HUD), buttons with pointer capture, the
 //        wheel in WHEEL_DELTA units.  The OS cursor is hidden over the game.
@@ -23,7 +25,8 @@
 // Pads:  polled every frame (gamepad.ts), with the page's share (padPage) and
 //        the touch controls' virtual controller merged in (touchPad).
 // Life:  blur and a hidden page deactivate the game (it parks, as after an
-//        alt-tab on Windows) and release everything held; focus and a visible
+//        alt-tab on Windows) and release everything held (a key still down
+//        is pressed again by its next autorepeat); focus and a visible
 //        page reactivate it; requestQuit() is WM_CLOSE.  Fullscreen locks the
 //        keyboard (navigator.keyboard.lock) so Escape and the browser's
 //        reserved shortcuts reach the game; holding Escape leaves fullscreen.
@@ -38,7 +41,7 @@ import { PadPoller, type PadPage, type TouchPad } from './gamepad';
 import { SynthDriver } from './synth';
 import {
   IEV_FOCUS, IEV_KEY_DOWN, IEV_KEY_TAP, IEV_KEY_UP, IEV_LOG, IEV_MOUSE_DOWN, IEV_MOUSE_MOVE, IEV_MOUSE_UP, IEV_QUIT, IEV_SMS,
-  IEV_PHOTO, IEV_RELEASE_ALL, IEV_TEXT, IEV_WHEEL, IKF_ALT, IKF_CTRL, IKF_DEAD, IKF_REPEAT, IKF_SHIFT, IKF_SYNTH, IKF_TOUCH, IM_ATTACHED,
+  IEV_PHOTO, IEV_NAME, IEV_RELEASE_ALL, IEV_TEXT, IEV_WHEEL, IKF_ALT, IKF_CTRL, IKF_DEAD, IKF_REPEAT, IKF_SHIFT, IKF_SYNTH, IKF_TOUCH, IM_ATTACHED,
   IM_EV_DROP, IM_EV_R, IM_EV_W, IM_EVENTS, IM_GAME_INACTIVE, IM_HDR_WORDS, IM_KEYS_HELD, IM_MAGIC, IM_MOUSE_X,
   IM_MOUSE_Y, IM_NAMES_GEN, IM_OFF_EV, IM_OFF_NAMES, IM_OFF_SYN, IM_QUIT_REQ, IM_SYN_R, IM_SYN_W, IM_TEXT,
   IM_TEXT_KIND, IM_TEXT_LEN, IM_TEXT_MAX, IM_TEXT_SEQ, IM_MENU_SCALE, IM_VERSION, IM_VIEW_ROLL, INPUT_EV_N, INPUT_MAGIC, INPUT_NAME_LEN,
@@ -90,6 +93,9 @@ export interface InputHandle {
   sms(id: number): boolean;
   /** photo mode (runtime/photo.c): what (its PH_* number) and its values.  false: it cannot reach the game */
   photo(what: number, a?: number, b?: number): boolean;
+  /** a new name for free roam and Online mode, now (the operator took the old one away: runtime/web/roam_web.c
+   *  roam_plat_name).  false: it cannot reach the game */
+  name(name: string): boolean;
   enterFullscreen(): Promise<boolean>;
   exitFullscreen(): Promise<void>;
   toggleFullscreen(): Promise<void>;
@@ -108,8 +114,9 @@ export interface InputHandle {
   touchPad(t: TouchPad | null): void;
   /** the touch controls' level horizon: the phone's tilt the game's 3D view turns against, radians, + = clockwise */
   viewRoll(rad: number): void;
-  /** the menus' help bar buttons' size, 1 = the game's own (touch.ts: the Menu button size) */
-  menuScale(s: number): void;
+  /** the menus' small buttons' size, 1 = the game's own (touch.ts: the Menu button size): the scroller arrows', and
+   *  with bar the help bar's too (else it keeps the game's own) */
+  menuScale(s: number, bar: boolean): void;
   /** performance.now() of a real controller's last button press (0: none) */
   padPressed(): number;
   /** the game's text entry while it is up, else null */
@@ -149,7 +156,7 @@ export function attachInput(proc: GameProcess, element: HTMLElement, opts: Input
   let pads: PadPoller | null = null, synth: SynthDriver | null = null;
   let raf = 0, timer = 0, detached = false;
   const f32 = new Float32Array(1), f32Bits = new Int32Array(f32.buffer);   // a float's bits for a mailbox word
-  let menu = 0;                     // the menus' size asked for (0: none), written once the mailbox is there
+  let menu = 0;                     // the menus' size asked for (0: none; negative: the arrows' alone), written once the mailbox is there
   const putMenu = () => { if (h && !detached && menu) { f32[0] = menu; Atomics.store(h, IM_MENU_SCALE, f32Bits[0]); } };
   // the mailbox was not ours (another writer, another layout): requests cannot reach the game
   let refused = false;
@@ -407,6 +414,19 @@ export function attachInput(proc: GameProcess, element: HTMLElement, opts: Input
       push(IEV_PHOTO, what, 0, 0, [], a, b);
       return true;
     },
+    name(name) {
+      if (!h || !api.canQuit()) return false;
+      // its printable ASCII (Your name's own rule), in pieces of 11 bytes: three chars, then a and b (little-endian)
+      const b = [...name].map(c => c.charCodeAt(0)).filter(c => c >= 0x20 && c < 0x7f).slice(0, 32);
+      if (!b.length) return false;
+      for (let off = 0; off < b.length; off += 11) {
+        const p = b.slice(off, off + 11);
+        while (p.length < 11) p.push(0);
+        const le = (i: number) => p[i] | p[i + 1] << 8 | p[i + 2] << 16 | p[i + 3] << 24;
+        push(IEV_NAME, off, b.length, 0, p.slice(0, 3), le(3), le(7));
+      }
+      return true;
+    },
     async enterFullscreen() {
       try {
         if (document.fullscreenElement !== element) await element.requestFullscreen({ navigationUI: 'hide' });
@@ -445,7 +465,7 @@ export function attachInput(proc: GameProcess, element: HTMLElement, opts: Input
     },
     touchPad(t) { pads?.setTouch(t); },
     viewRoll(rad) { if (h && !detached) { f32[0] = rad; Atomics.store(h, IM_VIEW_ROLL, f32Bits[0]); } },
-    menuScale(s) { menu = s; putMenu(); },
+    menuScale(s, bar) { menu = bar ? s : -s; putMenu(); },
     padPressed() { return pads?.lastPress ?? 0; },
     textEntry() {
       if (!h || !u8) return null;

@@ -12,8 +12,10 @@
 
 mod blocks;
 pub mod control;
+pub mod days;
 mod etag;
 mod files;
+mod friends;
 mod kept;
 mod lan;
 mod manifest;
@@ -152,7 +154,7 @@ const STATUS: [(u16, &str); 8] = [
     (503, "Service Unavailable"),
 ];
 
-pub const ROBOTS_TXT: &str = "User-agent: *\nAllow: /\nDisallow: /data/\nDisallow: /data-manifest\nDisallow: /game.wasm\nDisallow: /game.json\nDisallow: /players\nDisallow: /lan\nDisallow: /vault\nDisallow: /names";
+pub const ROBOTS_TXT: &str = "User-agent: *\nAllow: /\nDisallow: /data/\nDisallow: /data-manifest\nDisallow: /game.wasm\nDisallow: /game.json\nDisallow: /players\nDisallow: /seen\nDisallow: /lan\nDisallow: /vault\nDisallow: /names\nDisallow: /friends";
 
 /// what a client may ask a file to be sent as
 const TYPES: [(&str, &str); 11] = [
@@ -228,8 +230,12 @@ pub struct App {
     pub vault: Option<vault::VaultRoute>,
     /// claimed names (/names), none without keyphrase saves
     pub names: Option<names::NamesRoute>,
+    /// free roam's friends (/friends and the pages' friend messages), none without the Online host, the hub or names
+    pub friends: Option<Arc<friends::Friends>>,
     /// the operator's bans (the control socket: control.rs), checked at /lan
     pub bans: Arc<nfsu2_bans::Bans>,
+    /// how many come each day (days.rs: /seen, the hellos, the sweep)
+    pub days: Arc<days::Days>,
     /// SO_SNDBUF for /lan connections (NFSU2_LAN_SNDBUF, a measurement knob; 0: the kernel's own, which Linux grows
     /// to megabytes, ahead of the switch's own queue rules)
     lan_sndbuf: usize,
@@ -255,6 +261,7 @@ impl App {
         vault: Option<Arc<nfsu2_vault::Vault>>,
         names: Option<names::NamesRoute>,
         bans: Arc<nfsu2_bans::Bans>,
+        days: Arc<days::Days>,
         pool_threads: usize,
         lan_sndbuf: usize,
         compress_threads: usize,
@@ -318,6 +325,10 @@ impl App {
             raw.insert(code, s.into_bytes());
         }
         let max_conns = limits::max_connections(o.max_peers);
+        let friends = match (&online, &roam, &names) {
+            (Some(on), Some(r), Some(n)) => Some(friends::Friends::new(on.clone(), r.clone(), lan.clone(), n.claims.clone())),
+            _ => None,
+        };
         App {
             host_check,
             real_state,
@@ -346,7 +357,9 @@ impl App {
             roam,
             vault: vault.map(vault::VaultRoute::new),
             names,
+            friends,
             bans,
+            days,
             lan_sndbuf,
             o,
         }
@@ -537,12 +550,15 @@ impl App {
         if q.method == "PUT" && self.o.dev && !self.o.artifacts.is_empty() && p.starts_with("/artifacts/") {
             return self.put_artifact(q, s, &p[11..]).await;
         }
-        // keyphrase saves and claimed names: their own methods and bodies (vault.rs, names.rs)
+        // keyphrase saves, claimed names and friends: their own methods and bodies (vault.rs, names.rs, friends.rs)
         if p == "/vault" {
             return self.vault(q, s, &u).await;
         }
         if p == "/names" {
             return self.names(q, s, &u).await;
+        }
+        if p == "/friends" {
+            return self.friends_route(q, s, &u).await;
         }
         if q.method != "GET" && q.method != "HEAD" {
             return self
@@ -568,8 +584,10 @@ impl App {
         if let Some(rest) = p.strip_prefix("/data-blocks")
             && rest.starts_with('/')
         {
-            // (the manifest's addresses since blocks are kept: the same files)
-            let rest = rest.strip_prefix(blocks::V2).filter(|r| r.starts_with('/')).unwrap_or(rest);
+            // (the manifest's addresses since blocks are kept; the ones from before, without /v2, are no more)
+            let Some(rest) = rest.strip_prefix(blocks::V2).filter(|r| r.starts_with('/')) else {
+                return self.not_found(q, s).await;
+            };
             let file = files::resolve_game(&self.o.data, rest);
             return self.send_blocks(q, s, file, &u).await;
         }
@@ -581,6 +599,9 @@ impl App {
         }
         if p == "/players" {
             return self.send_players(q, s, &u).await;
+        }
+        if p == "/seen" {
+            return self.send_seen(q, s, &u).await;
         }
         if p == "/robots.txt" {
             return self.plain(q, s, 200, ROBOTS_TXT, &[], Cache::Revalidate, false).await;
@@ -654,7 +675,7 @@ impl App {
     /// is full and whether free roam is busy, nothing else, no names, addresses or times; online: in the game's Online
     /// mode (logged in, or racing an online race), null with --online off; roam: driving in free roam, or paused
     /// there, as of the hub's last tick (nfsu2-roam), null with --roam-hub off; full: a game that connects now waits in
-    /// line (a page of before: gets "LAN full"); queue: the pages waiting in line (nfsu2-lan queue.rs); roamBusy: the
+    /// line (a connection without ?queue, which cannot wait: "LAN full"); queue: the pages waiting in line (nfsu2-lan queue.rs); roamBusy: the
     /// hub gives fewer than askCap links a player, so the page does not ask the free-roam question now (false with
     /// --roam-hub off).  ?room=<hash> (roam_core's rc_room_hash of a Room setting, decimal,
     /// not 0) adds room: how many of roam are in that room (with --roam-hub on).  ?crews=<hash>,<hash>,... (the
@@ -707,6 +728,22 @@ impl App {
         if q.method != "HEAD" {
             send(s, body.as_bytes()).await?;
         }
+        finish(s).await
+    }
+
+    /// /seen?at=page|play&id=<the page's id>: a browser opened the page or pressed Play, counted for the day
+    /// (days.rs); 204, no body, whatever it said
+    async fn send_seen(&self, q: &Request, s: &mut Response, u: &url::Url) -> Res {
+        let what = match u.param("at").as_deref() {
+            Some("page") => Some(days::Seen::Page),
+            Some("play") => Some(days::Seen::Play),
+            _ => None,
+        };
+        if let (Some(what), Some(id), "GET") = (what, u.param("id"), q.method.as_str()) {
+            self.days.seen(&id, what, nfsu2_util::now_ms());
+        }
+        let h = self.headers(q, Cache::Store, true);
+        s.head(204, h.0);
         finish(s).await
     }
 

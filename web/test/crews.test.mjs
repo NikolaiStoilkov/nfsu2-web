@@ -34,7 +34,7 @@ test('the crews a value names', () => {
   assert.deepEqual(C.crewList('Zoë, zoË, КОМАНДА, команда'), ['Zoë', 'КОМАНДА'], 'capitals past A to Z small too (players.ts roomFold)');
   assert.equal(C.crewsValue(['Blue Room', 'Night Owls']), 'Blue Room, Night Owls');
   assert.deepEqual(C.crewList(C.crewsValue(['Blue Room', 'Night Owls', 'x'])), ['Blue Room', 'Night Owls', 'x']);
-  assert.deepEqual(C.CREW_PALETTE, ['3cd2ff', 'ff50c8', 'a078ff', 'ff4646', '4f7dff', 'fff03c', '3cf0f0', 'ff9ad5'], 'Thom\'s 8, the defaults first');
+  assert.deepEqual(C.CREW_PALETTE, ['3cd2ff', 'ff50c8', 'a078ff', 'ff4646', '4f7dff', 'fff03c', '3cf0f0', 'ff9ad5'], 'the 8 picked, the defaults first');
   assert.equal(C.CREW_COLOUR_NAMES.length, C.CREW_PALETTE.length, 'a name for each');
 });
 
@@ -198,12 +198,12 @@ test('/players?crews=: asked in the player\'s order, the counts by hash', async 
   let crews = [blue, owls], name = 'Team';
   const shown = [];
   let next;
-  const w = P.watchPlayers((line, counts) => { shown.push({ line: line(), counts }); next?.(); }, () => true, undefined, () => name, () => crews);
+  const w = P.watchPlayers((c, inRoom, counts) => { shown.push({ line: c ? P.roomLine(c, inRoom) : '', counts }); next?.(); }, () => true, undefined, () => name, () => crews);
   const wait = () => new Promise(r => { next = r; });
   await wait();
   assert.equal(asked[0], `/players?room=${room}&crews=${blue},${owls}`);
   assert.deepEqual([...shown[0].counts], [[blue, 2], [owls, 0]]);
-  assert.match(shown[0].line, /You are in room "Team": 1 in free roam there\./);
+  assert.equal(shown[0].line, 'You are in room "Team": 1 in free roam there.', 'the Room row\'s line');
   crews = [owls]; name = ''; answer = { players: 3, online: 1, roam: 2, crews: [5] };
   w.now(); await wait();
   assert.equal(asked[1], `/players?crews=${owls}`);
@@ -228,7 +228,7 @@ test('/players: an answer that comes after a later question\'s is not shown (the
   };
   let crews = [];
   const shown = [];
-  const w = P.watchPlayers((line, counts) => shown.push(counts), () => true, undefined, () => '', () => crews);
+  const w = P.watchPlayers((c, inRoom, counts) => shown.push(counts), () => true, undefined, () => '', () => crews);
   await new Promise(r => setTimeout(r, 0));
   crews = [blue];
   const fresh = await w.fresh(1000);

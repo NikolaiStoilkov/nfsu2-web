@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::world::{C, Opts, World};
 use crate::buddy::BuddyLimits;
 use crate::lobby::Limits;
+use crate::stats::Period;
 use crate::trace::{LobbyTrace, TraceState};
 use crate::vhost::{DATA, lan_frame};
 use crate::{PORT_LOBBY, VHOST_VIP};
@@ -234,13 +235,16 @@ fn onl3_messenger_memory() {
             if w.c(cb).l("RADD").code.is_empty() {
                 ok += 1;
             }
+            // (gone: a persona online keeps its list in memory, one that left makes room)
+            w.close(cb);
+            w.close(cl);
         }
         ok
     };
     assert!(made(&mut w, "G") <= 5, "one client: at most listRate new lists");
     made(&mut w, "H");
     made(&mut w, "I");
-    assert!(w.core.buddies.lists.len() <= 10, "{} lists kept (the cap is 10)", w.core.buddies.lists.len());
+    assert!(w.core.buddies.lists.len() <= 10, "{} lists in memory (the cap is 10)", w.core.buddies.lists.len());
 }
 
 // ONL-4: a Messenger connection that logged in twice and closed breaks nobody's Messenger
@@ -347,7 +351,7 @@ fn onl6_blocked_list_follows_the_name() {
     w.send(mb, "RADM", fields![("USER", "Alice"), ("ID", 3)]);
     w.close(mb);
     w.core.buddy_save();
-    let stored = std::fs::read_to_string(dir.join("buddies.json")).unwrap();
+    let stored = crate::buddy::shelf_texts(&dir).join("\n");
     assert!(stored.contains(r#""I":["Mallory"]"#), "the blocked list is kept: {stored}");
     assert!(!stored.contains("still there") && !stored.contains(r#""R""#), "nothing of Mallory's waits: {stored}");
     // over a restart: whoever plays as Alice has the list
@@ -364,12 +368,12 @@ fn onl6_blocked_list_follows_the_name() {
     w.send(b2, "RDEL", fields![("LIST", "I"), ("USER", "Mallory")]);
     assert!(!w.core.buddies.blocked("mallory"));
     w.core.buddy_save();
-    assert!(!std::fs::read_to_string(dir.join("buddies.json")).unwrap().contains(r#""I""#));
+    assert!(!crate::buddy::shelf_texts(&dir).join("\n").contains(r#""I""#));
 }
 
 fn board(w: &mut World, kind: u32) -> Vec<String> {
     let mut b: Vec<String> =
-        w.core.stats.board(kind, false).iter().map(|r| format!("{}:{}:{}:{}", r.name, r.points, r.wins, r.losses)).collect();
+        w.core.stats.board(kind, Period::All).iter().map(|r| format!("{}:{}:{}:{}", r.name, r.points, r.wins, r.losses)).collect();
     b.sort();
     b
 }
@@ -503,26 +507,204 @@ fn a_race_no_racer_drives_is_a_cheat_line() {
     assert_eq!(
         l[1..],
         ["[cheat] 10.77.4.4 \"Tele\": won the online race \"tele\" (sprint, track 4102, 1 lap) in 0:25.00, 763 km/h on \
-          average, which no car does: by its own game; its top speed 954 km/h"]
+          average, which no car does, an edited car (no car of the game makes 420 km/h): by its own game; its top speed \
+          954 km/h"]
+    );
+    // an edited car is a line whether it finished or not (its top speed: 96 m/s on average, 432 km/h at the most)
+    race_of(&mut w, "planes", "Honest3", "Plane", &[(0, 1, 56.49, 29.83, false), (1, 0, 10.0, 96.0, true)]);
+    let l = cheats(&w);
+    assert_eq!(
+        l[2..],
+        ["[cheat] 10.77.4.6 \"Plane\": raced in the online race \"planes\" (sprint, track 4102, 1 lap), an edited car (no \
+          car of the game makes 420 km/h): by its own game; its top speed 432 km/h"]
+    );
+    // a racer whose game went on alone long after the race ended (nfsu2.xyz, 2026-10-31: 19.6 km in 12 minutes) says
+    // nothing of the winner's way (9.7 km in 2:54)
+    race_of(&mut w, "split", "Funny", "Gone", &[(0, 1, 174.09, 55.97, false), (1, 0, 720.0, 27.28, true)]);
+    assert_eq!(cheats(&w).len(), 3, "{:?}", cheats(&w));
+}
+
+/// a race report with each player's average and top speed: (index, place, time, average m/s, top m/s, dropped)
+fn resu_top(kind: u8, players: &[(u8, u8, f32, f32, f32, bool)]) -> String {
+    use base64::Engine;
+    let mut b = base64::engine::general_purpose::STANDARD
+        .decode(resu_avg(kind, &players.iter().map(|p| (p.0, p.1, p.2, p.3, p.5)).collect::<Vec<_>>()))
+        .unwrap();
+    for (i, p) in players.iter().enumerate() {
+        let o = 8 + 55 * i;
+        b[o + 20..o + 24].copy_from_slice(&p.4.to_be_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+// a racer's own time, average and way count once another racer's game saw it finish at that time, and nobody finished
+// close to it (nfsu2.xyz, 2026-10-31, all honest racers: two drag winners' own games 7 s short of the others' and so
+// 357 and 500 km/h on average, one with no other report; a circuit winner at "388 km/h" with a top speed of 183, the
+// second 0.15 s behind; one whose own game counted the first lap of two); a cheat's own figures are the others' too
+#[test]
+fn a_racers_own_figures_count_once_another_game_saw_them() {
+    let mut w = world();
+    let cheats = |w: &World| w.text().iter().filter(|l| l.starts_with("[cheat]")).cloned().collect::<Vec<_>>();
+    type Rows<'a> = &'a [(u8, u8, f32, f32, f32, bool)];
+    let race_of = |w: &mut World, name: &str, a: &str, b: &str, kind: u8, ra: Rows, rb: Option<Rows>| {
+        let k = a.bytes().last().unwrap() - b'0';
+        let (ga, gb) = (client(w, &format!("10.77.10.{k}")), client(w, &format!("10.77.11.{k}")));
+        let (x, y) = (login(w, ga, a), login(w, gb, b));
+        let auth = race(w, name, &[x, y], vec![]).unwrap();
+        // (a game that says nothing for 120 s is dropped: each pings once on the way)
+        w.advance(100_000.0);
+        for c in [x, y] {
+            w.send(c, "~png", fields![("TIME", 1)]);
+        }
+        w.advance(80_000.0);
+        for (c, rows) in [(x, Some(ra)), (y, rb)] {
+            let Some(rows) = rows else { continue };
+            w.send(c, "rank", fields![("AUTH", auth.as_str()), ("RESU", resu_top(kind, rows)), ("NAME0", a), ("NAME1", b)]);
+        }
+    };
+    // its own game 7 s short (0:17.35 at 99 m/s, 357 km/h; top 89 m/s), the other's 0:24.14
+    race_of(&mut w, "short", "Drag1", "Other1", 2, &[(0, 1, 17.35, 99.2, 89.2, false), (1, 2, 31.3, 60.0, 80.0, false)],
+        Some(&[(0, 1, 24.14, 70.0, 89.2, false), (1, 2, 31.3, 60.0, 80.0, false)]));
+    // its own report alone (500 km/h on average)
+    race_of(&mut w, "alone", "Drag2", "Other2", 2, &[(0, 1, 14.09, 138.9, 96.7, false), (1, 2, 20.0, 60.0, 80.0, false)], None);
+    // a close race (388 km/h on average, top 51 m/s), both games agree
+    let close: Rows = &[(0, 1, 81.11, 107.8, 50.8, false), (1, 2, 81.3, 30.0, 50.0, false)];
+    race_of(&mut w, "close", "Circ1", "Other3", 0, close, Some(close));
+    // its own game counted one lap of two: 3087 m in 1:22.13, the other 6418 m; the other's game saw it at 2:35.34
+    race_of(&mut w, "lap", "Circ2", "Other4", 0, &[(0, 1, 82.13, 37.59, 48.6, false), (1, 2, 174.95, 36.68, 50.0, false)],
+        Some(&[(0, 1, 155.34, 41.3, 48.6, false), (1, 2, 174.95, 36.68, 50.0, false)]));
+    assert_eq!(cheats(&w), Vec::<String>::new());
+    // a circuit won in 0:30.08 at 383 km/h on average (top 113 m/s), the other game saw it too and gave up
+    let fast: Rows = &[(0, 1, 30.08, 106.4, 113.0, false), (1, 0, 40.0, 30.0, 50.0, true)];
+    race_of(&mut w, "warp", "Circ3", "Other5", 0, fast, Some(fast));
+    assert_eq!(
+        cheats(&w),
+        ["[cheat] 10.77.10.3 \"Circ3\": won the online race \"warp\" (circuit, track 4102, 1 lap) in 0:30.08, 383 km/h on \
+          average, which no car does: by its own game; its top speed 407 km/h"]
     );
 }
 
-// what a game shows of another racer is no [cheat] line (nfsu2.xyz, 2026-10-29: Ozz's game had Nef win a 4-minute
-// sprint at 7457 km/h, and a racer who left at 91 km): only each racer's own game's figures count
+// a racer whose game says its car's data is edited (the rank's code "ed" and the car type: runtime/mprace.c; a guide
+// passed among players, 2026-10-31, edits one car in the browser's copy of GlobalB) is a [cheat] line however it did,
+// finished or not; the game's own code (0) and other codes are none
+#[test]
+fn a_car_of_edited_game_data_is_a_cheat_line() {
+    use crate::aries::encode_frame;
+    let mut w = world();
+    let cheats = |w: &World| w.text().iter().filter(|l| l.starts_with("[cheat]")).cloned().collect::<Vec<_>>();
+    let race_of = |w: &mut World, name: &str, a: &str, b: &str, codes: [&str; 2], players: &[(u8, u8, f32, f32, bool)]| {
+        let (ga, gb) = (client(w, &format!("10.77.5.{}", name.len())), client(w, &format!("10.77.6.{}", name.len())));
+        let (x, y) = (login(w, ga, a), login(w, gb, b));
+        let auth = race(w, name, &[x, y], vec![]).unwrap();
+        w.advance(61_000.0);
+        for (c, code) in [x, y].into_iter().zip(codes) {
+            let f = fields![("AUTH", auth.as_str()), ("RESU", resu_avg(1, players)), ("NAME0", a), ("NAME1", b)];
+            w.send_raw(c, &encode_frame("rank", code, &f).unwrap());
+        }
+    };
+    let honest = [(0, 1, 56.49, 29.83, false), (1, 2, 58.15, 29.64, false)];
+    race_of(&mut w, "plain", "Fast1", "Slow1", ["", "filt"], &honest);
+    race_of(&mut w, "odd", "Fast2", "Slow2", ["edz9", "ed1"], &honest);
+    assert_eq!(cheats(&w), Vec::<String>::new());
+    race_of(&mut w, "supra", "Tuner", "Slow3", ["ed0f", ""], &honest);
+    assert_eq!(
+        cheats(&w),
+        ["[cheat] 10.77.5.5 \"Tuner\": won the online race \"supra\" (sprint, track 4102, 1 lap) in 0:56.49, an edited car \
+          (SUPRA, type 15: its game has the car's data edited, GlobalB): by its own game; its top speed 134 km/h"]
+    );
+    // not finished, and a car its game could not tell
+    race_of(&mut w, "gone", "Slow4", "Quit", ["", "edff"], &[(0, 1, 56.49, 29.83, false), (1, 0, 30.0, 25.0, true)]);
+    assert_eq!(
+        cheats(&w)[1..],
+        ["[cheat] 10.77.6.4 \"Quit\": raced in the online race \"gone\" (sprint, track 4102, 1 lap), an edited car (type \
+          unknown: its game has the car's data edited, GlobalB): by its own game; its top speed 112 km/h"]
+    );
+}
+
+/// a drift race's report: (index, place, time, points, the biggest single drift's points, top speed m/s, dropped)
+fn resu_drift(players: &[(u8, u8, f32, i32, i32, f32, bool)]) -> String {
+    let mut b = vec![0u8; 8 + 55 * players.len()];
+    b[0] = 3;
+    b[1] = players.len() as u8;
+    b[2] = 3;
+    b[4..6].copy_from_slice(&4311u16.to_be_bytes());
+    b[7] = 3;
+    for (i, (index, place, time, score, best, top, out)) in players.iter().enumerate() {
+        let o = 8 + 55 * i;
+        b[o] = *index;
+        b[o + 1] = *place;
+        b[o + 2] = if *out { 0x0b } else { 1 };
+        b[o + 8..o + 12].copy_from_slice(&time.to_be_bytes());
+        b[o + 16..o + 20].copy_from_slice(&(top * 0.6).to_be_bytes());
+        b[o + 20..o + 24].copy_from_slice(&top.to_be_bytes());
+        b[o + 44..o + 48].copy_from_slice(&score.to_be_bytes());
+        b[o + 48..o + 52].copy_from_slice(&best.to_be_bytes());
+        if *out {
+            b[o + 32..o + 36].copy_from_slice(&(-1.0f32).to_be_bytes());
+        }
+    }
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+// a drift race: each racer's own game's points and biggest drift on a line of its own, the result by points with the
+// track; a top speed no car makes is an edited car's, as in other races
+#[test]
+fn a_drift_races_points_are_logged_and_an_edited_car_is_a_cheat_line() {
+    let mut w = world();
+    let (ga, gb) = (client(&mut w, "10.77.7.1"), client(&mut w, "10.77.7.2"));
+    let (x, y) = (login(&mut w, ga, "Slider"), login(&mut w, gb, "Rocket"));
+    let auth = race(&mut w, "dh", &[x, y], vec![]).unwrap();
+    w.advance(100_000.0);
+    // (Rocket first with 1.2 million points and 125 m/s: 450 km/h)
+    let rows = [(1, 1, 70.0, 1_200_000, 1_150_000, 125.0, false), (0, 2, 80.5, 310_400, 42_000, 61.0, false)];
+    for c in [x, y] {
+        w.send(c, "rank", fields![("AUTH", auth.as_str()), ("RESU", resu_drift(&rows)), ("NAME0", "Slider"), ("NAME1", "Rocket")]);
+    }
+    let t = w.text();
+    let has = |want: &str| t.iter().any(|l| l == want);
+    assert!(
+        has("[online] \"dh\" (drift, track 4311, 3 laps): Slider's own game: 2 of 2, 310400 points, its biggest drift 42000, top speed 220 km/h, 1:20.50"),
+        "{}",
+        t.join("\n")
+    );
+    assert!(
+        has("[online] \"dh\" (drift, track 4311, 3 laps): Rocket's own game: 1 of 2, 1200000 points, its biggest drift 1150000, top speed 450 km/h, 1:10.00"),
+        "{}",
+        t.join("\n")
+    );
+    assert!(has("[online] \"dh\" (drift, unranked, track 4311, 3 laps): 1 Rocket 1200000 points, 2 Slider 310400 points"), "{}", t.join("\n"));
+    let cheats: Vec<&String> = t.iter().filter(|l| l.starts_with("[cheat]")).collect();
+    assert_eq!(
+        cheats,
+        ["[cheat] 10.77.7.2 \"Rocket\": won the online race \"dh\" (drift, track 4311, 3 laps) with 1200000 points, an edited car \
+          (no car of the game makes 420 km/h): by its own game; its top speed 450 km/h"]
+    );
+}
+
+// what a game shows of another racer is no [cheat] line (nfsu2.xyz, 2026-10-29: one game had another racer win a
+// 4-minute sprint at 7457 km/h, and a racer who left at 91 km): only each racer's own game's figures count
 #[test]
 fn what_a_game_shows_of_the_others_is_no_cheat_line() {
     let mut w = world();
     let (ga, gb, gc) = (client(&mut w, "10.77.6.1"), client(&mut w, "10.77.6.2"), client(&mut w, "10.77.6.3"));
-    let (x, y, z) = (login(&mut w, ga, "Ozz"), login(&mut w, gb, "Nef"), login(&mut w, gc, "Left"));
+    let (x, y, z) = (login(&mut w, ga, "Ann"), login(&mut w, gb, "Bob"), login(&mut w, gc, "Left"));
     let auth = race(&mut w, "seen", &[x, y, z], vec![]).unwrap();
-    w.advance(240_000.0);
+    // (a game that says nothing for 120 s is dropped: each pings on the way)
+    for _ in 0..3 {
+        w.advance(80_000.0);
+        for c in [x, y, z] {
+            w.send(c, "~png", fields![("TIME", 1)]);
+        }
+    }
     let send = |w: &mut World, c, rows: &[(u8, u8, f32, f32, bool)]| {
-        let f = fields![("AUTH", auth.as_str()), ("RESU", resu_avg(1, rows)), ("NAME0", "Ozz"), ("NAME1", "Nef"), ("NAME2", "Left")];
+        let f = fields![("AUTH", auth.as_str()), ("RESU", resu_avg(1, rows)), ("NAME0", "Ann"), ("NAME1", "Bob"), ("NAME2", "Left")];
         w.send(c, "rank", f);
     };
     send(&mut w, x, &[(1, 1, 223.37, 2071.4, false), (0, 2, 225.18, 36.98, false), (2, 3, 57.34, 1600.0, true)]);
     send(&mut w, y, &[(1, 1, 223.37, 37.5, false), (0, 2, 225.18, 37.1, false), (2, 3, 57.34, 30.0, true)]);
     send(&mut w, z, &[(1, 1, 223.37, 37.5, false), (0, 2, 225.18, 37.1, false), (2, 3, 57.34, 30.0, true)]);
+    assert!(w.logged("\"seen\" (sprint, unranked): 1 Bob 3:43.37, 2 Ann 3:45.18"), "{}", w.text().join("\n"));
     assert!(!w.text().iter().any(|l| l.starts_with("[cheat]")), "{}", w.text().join("\n"));
 }
 
@@ -541,11 +723,67 @@ fn a_report_naming_a_racer_twice_is_no_cheat_line() {
     assert!(!w.text().iter().any(|l| l.starts_with("[cheat]")), "{}", w.text().join("\n"));
 }
 
+// a report that leaves out a player of the game is taken: the others' games leave out one who joined as the race
+// started and never raced (nfsu2.xyz, 2026-10-30: 460 reports of 221 races not taken, none of them looked at)
+#[test]
+fn a_report_without_a_player_who_never_raced_is_taken() {
+    let mut w = world();
+    let (ga, gb, gc) = (client(&mut w, "10.77.8.1"), client(&mut w, "10.77.8.2"), client(&mut w, "10.77.8.3"));
+    let (x, y, z) = (login(&mut w, ga, "Ran1"), login(&mut w, gb, "Ran2"), login(&mut w, gc, "Late"));
+    let auth = race(&mut w, "late", &[x, y, z], vec![]).unwrap();
+    w.advance(120_000.0);
+    for c in [x, y] {
+        report(&mut w, c, &auth, &["Ran1", "Ran2"], &[(0, 1, 100.5), (1, 2, 102.25)], 1);
+    }
+    assert!(w.text().iter().any(|l| l.ends_with("\"late\" (sprint, unranked): 1 Ran1 1:40.50, 2 Ran2 1:42.25")), "{}", w.text().join("\n"));
+    // (one that names a racer not of the game is not)
+    report(&mut w, z, &auth, &["Ran1", "Nobody"], &[(0, 1, 100.5), (1, 2, 102.25)], 1);
+    assert!(w.logged("\"late\": Late's race report not taken: not the game's players"), "{}", w.text().join("\n"));
+}
+
+// a win far quicker than the track's best racers (a car no tuning makes, a speed hack): once the track had 10 clean
+// races, one under 70 % of the third quickest other racer's time (any finisher's, not the winners' alone) is a [cheat]
+// line
+#[test]
+fn a_win_far_under_the_tracks_third_quickest_is_a_cheat_line() {
+    let mut w = world();
+    let race_of = |w: &mut World, k: usize, a: &str, t: f32, next: f32| {
+        let (ga, gb) = (client(w, &format!("10.77.9.{}", 2 * k + 1)), client(w, &format!("10.77.9.{}", 2 * k + 2)));
+        let b = format!("Other{k}");
+        let (x, y) = (login(w, ga, a), login(w, gb, &b));
+        let auth = race(w, &format!("q{k}"), &[x, y], vec![]).unwrap();
+        w.advance(120_000.0);
+        for c in [x, y] {
+            report(w, c, &auth, &[a, &b], &[(0, 1, t), (1, 2, next)], 1);
+        }
+    };
+    let cheats = |w: &World| w.text().into_iter().filter(|l| l.starts_with("[cheat]")).collect::<Vec<String>>();
+    for k in 0..10 {
+        race_of(&mut w, k, &format!("Fair{k}"), 100.0 + k as f32, 105.0 + k as f32);
+    }
+    race_of(&mut w, 10, "Fast", 72.0, 100.0);
+    assert_eq!(cheats(&w), Vec::<String>::new(), "72 s: over 70 % of 102 s");
+    // two cars far quicker than the track's best winners, close together (nfsu2.xyz, 2026-10-31: four within 4 s):
+    // that time can be driven, and it is a clean win
+    race_of(&mut w, 11, "Pair", 60.0, 62.0);
+    assert_eq!(cheats(&w), Vec::<String>::new(), "the next finisher close behind");
+    // as quick as the track's quick racers, the winners' and the others' (nfsu2.xyz, 2026-10-31: a drag racer's 23.3 s
+    // wins were under 70 % of the third quickest winner's, with others finishing in 23.4 to 24 s)
+    race_of(&mut w, 12, "Peer", 58.0, 100.0);
+    assert_eq!(cheats(&w), Vec::<String>::new(), "58 s: over 70 % of 72 s (Pair 60, Other11 62, Fast 72)");
+    race_of(&mut w, 13, "Rocket", 40.0, 100.0);
+    assert_eq!(
+        cheats(&w),
+        ["[cheat] 10.77.9.27 \"Rocket\": won the online race \"q13\" (sprint, track 4014, 2 laps) in 0:40.00, under 70 % of the \
+          third quickest other racer's time of the track's 13 clean races (1:02.00): as the result stands"]
+    );
+}
+
 // results: race types by the game's numbers (drag 2, drift 3); its seventh (6) is a result that counts nowhere
 #[test]
 fn race_types() {
     let mut w = world();
-    let boards = |w: &mut World| (0..6).map(|t| w.core.stats.board(t, false).len()).collect::<Vec<_>>();
+    let boards = |w: &mut World| (0..6).map(|t| w.core.stats.board(t, Period::All).len()).collect::<Vec<_>>();
     // a quarter-mile drag: times well under the other types' 20 s
     let g = client(&mut w, "10.77.0.2");
     let a = login(&mut w, g, "Drag1");
@@ -567,7 +805,7 @@ fn race_types() {
     for x in [c, d] {
         report(&mut w, x, &auth, &["Drift1", "Drift2"], &[(0, 1, 104.0), (1, 2, 92.0)], 3);
     }
-    assert!(w.logged("\"drift\" (drift, unranked): 1 Drift1"), "{}", w.text().join("\n"));
+    assert!(w.logged("\"drift\" (drift, unranked, track 4014, 2 laps): 1 Drift1 0 points, 2 Drift2 0 points"), "{}", w.text().join("\n"));
     assert_eq!(boards(&mut w), [0, 0, 2, 2, 0, 0]);
     // the seventh: the result is taken and logged; no board or career counts it
     let g = client(&mut w, "10.77.0.6");
@@ -590,7 +828,8 @@ fn race_types() {
 }
 
 // a ranked race's table on its players' results screens: whose reports came ($rup) until the result stands, then
-// places, times or drift scores and points in hex ($rfn) to every reporter, and to a later one; unranked: none
+// places, times or drift scores and points in hex ($rfn) to every reporter, and to a later one; unranked: none; the
+// careers of the players who reported before it stood are sent again, with the race's points
 #[test]
 fn ranked_table() {
     let mut w = world();
@@ -623,6 +862,10 @@ fn ranked_table() {
     }
     assert_eq!(w.c(s[0]).count("$rup"), 0, "the result stood with Ann's report");
     assert_eq!(board(&mut w, 0), ["Ann:50:0:1", "Bob:100:1:0", "Cat:0:0:1"], "the table's points are the rankings'");
+    // and the careers': Bob's report came before the result stood, and his game is told his 100 points too (STAT's
+    // circuit rating, its 9th number)
+    let rating = |w: &World, c: C| w.c(c).l("user").g("STAT").split(',').nth(8).map(str::to_string);
+    assert_eq!((rating(&w, s[1]), rating(&w, s[0])), (Some("64".into()), Some("32".into())));
     // a later report: the table to it alone
     rep(&mut w, s[2], &auth, 0, &circuit);
     assert_eq!(row(w.c(s[2]).l("$rfn"), 2), "Cat ea60,-2,0,0,0");
@@ -695,6 +938,119 @@ fn leavers_decide_nothing() {
     }
     assert!(!w.logged("\"d\" (circuit"), "{}", w.text().join("\n"));
     assert_eq!(board(&mut w, 0), ["Ann:67:0:1", "Bob:100:1:0", "Cat:0:0:1", "Dan:0:0:1"], "counted nowhere");
+}
+
+/// The three games' reports of a test race (online-pair, 2026-11-02): a ranked circuit of OLHOST, OLJOIN3 and OLJOIN
+/// (NAME0..2).  OLJOIN3 finished first (0:29.9); the others were still on the way when the race ended 30 s later, and
+/// every game put them out on the road: state 0x0b, places 2 and 3 where they were then, times of 60 s.
+const OUT_OF_TIME: [(&str, &str); 3] = [
+    (
+        "OLJOIN3",
+        "AwMAAQ+rAAIAAgsEP4m32UJwK4ZCXtcLQejLTkITDAhBCj1xAAAAAL+AAAAAAAAAAAAAAAAAAAAAAAAAAAACAAYBAQEEPvgFa0HvSsEAAAAAQcasJUITKMZBBwo+QXx64kIntncAAAAAAAAAAAAAAAAAAAAAAAAAAgMLBD+DJh9CbyuGQmrhSEHfmzxCEkAiQQ/XCwAAAAC/gAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    ),
+    (
+        "OLJOIN",
+        "AwMAAg+rAAIAAgsEP4o5X0JwpyxCXhR8QelCK0IS5VdBDXCkAAAAAL+AAAAAAAAAAAAAAAAAAAAAAAAAAAACAAgBAQEEPvkMtEHxo9gAAAAAQdrPN0IUPcZBC9cLQXThSEIdnkUAAAAAAAAAAAAAAAAAAAAAAAgAAAECAwsEP4PSeEJvsKVCaczOQdaGTkITRdFBDwo+AAAAAL+AAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    ),
+    (
+        "OLHOST",
+        "AwMAAA+rAAIAAgsEP4nvTkJvsGNCXpmaQd+VMkITPLlBBZmaAAAAAL+AAAAAAAAAAAAAAAAAAAAAAAAAAAACAAYBAQEEPvk9okHxOdwAAAAAQeytxEIUhHZBCj1xQX199UIalBoAAAAAAAAAAAAAAAAAAAAAAAoAAAEAAQIDCwQ/g5CJQm70vUJpCj5B53kdQhOipUEVHrkAAAAAv4AAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    ),
+];
+
+// a race that one racer finished and the others ran out of time in counts: the reports of the racers put out on the
+// road (they raced to the end and saw the finisher cross the line) decide it with the finisher's.  Until 2026-11 they
+// decided nothing ("did not finish"), the finisher's alone could not, and such a race never counted nor showed
+// Official Race Results.  The racers out of time did not finish, and did not leave: no disconnect in their careers
+#[test]
+fn racers_out_of_time_decide_with_the_finisher() {
+    let mut w = world();
+    let names = ["OLHOST", "OLJOIN3", "OLJOIN"];
+    let gs: Vec<u32> = (0..3).map(|i| client(&mut w, &format!("10.77.0.{}", i + 2))).collect();
+    let s: Vec<C> = (0..3).map(|i| login(&mut w, gs[i], names[i])).collect();
+    let auth = race(&mut w, "o", &s, fields![("SYSFLAGS", 1 << 18)]).unwrap();
+    w.advance(125_000.0);
+    let s: Vec<C> = (0..3).map(|i| login(&mut w, gs[i], names[i])).collect();
+    let session = |who: &str| s[names.iter().position(|n| *n == who).unwrap()];
+    let rep = |w: &mut World, (who, resu): (&str, &str)| {
+        let mut f = fields![("AUTH", auth.as_str()), ("RESU", resu)];
+        for (i, n) in names.iter().enumerate() {
+            f.extend(fields![(format!("NAME{i}"), *n)]);
+        }
+        w.send(session(who), "rank", f);
+    };
+    rep(&mut w, OUT_OF_TIME[0]);
+    assert!(board(&mut w, 0).is_empty(), "the finisher's report alone decides nothing");
+    rep(&mut w, OUT_OF_TIME[1]);
+    assert!(
+        w.logged("\"o\" (circuit, ranked): 1 OLJOIN3 0:30.21, DNF OLHOST (out of time), DNF OLJOIN (out of time)"),
+        "{}",
+        w.text().join("\n")
+    );
+    assert_eq!(board(&mut w, 0), ["OLHOST:0:0:1", "OLJOIN3:100:1:0", "OLJOIN:0:0:1"]);
+    assert_eq!([s[1], s[2]].map(|c| w.c(c).count("$rfn")), [1, 1], "Official Race Results on both screens");
+    rep(&mut w, OUT_OF_TIME[2]);
+    assert!(!w.logged("decides nothing") && !w.logged("differs"), "{}", w.text().join("\n"));
+    assert_eq!(w.c(s[0]).count("$rfn"), 1);
+    // no disconnect for a racer who ran out of time (STAT [1]); one for a racer who left
+    let disconnects = |w: &mut World, who: &str| -> String {
+        w.send(s[0], "user", fields![("PERS", who)]);
+        w.c(s[0]).l("user").g("STAT").split(',').nth(1).unwrap().to_string()
+    };
+    assert_eq!(disconnects(&mut w, "OLJOIN"), "0");
+    assert!(w.core.lobby.games.is_empty(), "every racer reported: the race is over");
+}
+
+// two finishers' games may tell a racer who did not finish differently: one counts a leaver as gone, the other left it
+// out of its report; one saw two racers out of time in one order on the road, the other in the other.  Only the
+// finishers' places are compared, and the result has every racer either report named (a ranked race of three keeps
+// its points with its leaver left out of the report that decided it)
+#[test]
+fn the_others_places_do_not_decide() {
+    let mut w = world();
+    let names = ["Ann", "Bob", "Cat", "Dan", "Eve"];
+    let gs: Vec<u32> = (0..5).map(|i| client(&mut w, &format!("10.77.0.{}", i + 2))).collect();
+    let login_all = |w: &mut World| -> Vec<C> { (0..5).map(|i| login(w, gs[i], names[i])).collect() };
+    let rep = |w: &mut World, c: C, auth: &str, names: &[&str], players: &[(u8, u8, f32, i32, bool)]| {
+        let mut f = fields![("AUTH", auth), ("RESU", resu_full(0, 4014, players))];
+        for (i, n) in names.iter().enumerate() {
+            f.extend(fields![(format!("NAME{i}"), *n)]);
+        }
+        w.send(c, "rank", f);
+    };
+    // Ann, Bob and Cat, ranked: Cat leaves; Ann's game counts it as gone, Bob's leaves it out
+    let s = login_all(&mut w);
+    let auth = race(&mut w, "l", &s[0..3], fields![("SYSFLAGS", 1 << 18)]).unwrap();
+    w.advance(200_000.0);
+    let s = login_all(&mut w);
+    rep(&mut w, s[0], &auth, &names[0..3], &[(0, 2, 190.0, 0, false), (1, 1, 186.0, 0, false), (2, 3, 60.0, 0, true)]);
+    rep(&mut w, s[1], &auth, &names[0..2], &[(0, 2, 190.1, 0, false), (1, 1, 186.0, 0, false)]);
+    assert!(w.logged("\"l\" (circuit, ranked): 1 Bob 3:06.00, 2 Ann 3:10.10, DNF Cat"), "{}", w.text().join("\n"));
+    assert_eq!(board(&mut w, 0), ["Ann:50:0:1", "Bob:100:1:0", "Cat:0:0:1"]);
+    rep(&mut w, s[2], &auth, &names[0..3], &[(0, 1, 60.0, 0, true), (1, 2, 60.0, 0, true), (2, 3, 60.0, 0, true)]);
+    // all five (Ann first, Bob second; Cat and Dan left, Eve never got going): Ann's game has Cat and Dan at other
+    // places than Bob's, and Eve gone; Bob's game left Eve out
+    let auth = race(&mut w, "m", &s, fields![("SYSFLAGS", 1 << 18), ("MAXSIZE", 6)]).unwrap();
+    w.advance(200_000.0);
+    let s = login_all(&mut w);
+    let ann = [(0, 1, 180.0, 0, false), (1, 2, 181.0, 0, false), (2, 4, 50.0, 0, true), (3, 3, 51.0, 0, true), (4, 5, 9.0, 0, true)];
+    let bob = [(0, 1, 180.0, 0, false), (1, 2, 181.0, 0, false), (2, 3, 50.0, 0, true), (3, 4, 51.0, 0, true)];
+    rep(&mut w, s[0], &auth, &names, &ann);
+    rep(&mut w, s[1], &auth, &names[0..4], &bob);
+    assert!(w.logged("\"m\" (circuit, ranked): 1 Ann 3:00.00, 2 Bob 3:01.00, DNF Cat, DNF Dan, DNF Eve"), "{}", w.text().join("\n"));
+    assert!(!w.logged("differs"), "{}", w.text().join("\n"));
+    assert_eq!(board(&mut w, 0), ["Ann:150:1:1", "Bob:175:1:1", "Cat:0:0:2", "Dan:0:0:1", "Eve:0:0:1"]);
+    // the leavers' careers: a disconnect for each race they left
+    w.send(s[0], "user", fields![("PERS", "Cat")]);
+    assert_eq!(w.c(s[0]).l("user").g("STAT").split(',').nth(1), Some("2"));
+    // finishers whose games had the finishers the other way round still differ
+    let auth = race(&mut w, "n", &s[0..3], fields![("SYSFLAGS", 1 << 18)]).unwrap();
+    w.advance(200_000.0);
+    let s = login_all(&mut w);
+    rep(&mut w, s[0], &auth, &names[0..3], &[(0, 1, 180.0, 0, false), (1, 2, 180.1, 0, false), (2, 3, 190.0, 0, false)]);
+    rep(&mut w, s[1], &auth, &names[0..3], &[(0, 2, 180.1, 0, false), (1, 1, 180.0, 0, false), (2, 3, 190.0, 0, false)]);
+    assert!(w.logged("\"n\": Bob's report differs (1 Bob 3:00.00, 2 Ann 3:00.10, 3 Cat 3:10.00)"), "{}", w.text().join("\n"));
+    assert!(!w.logged("\"n\" (circuit"), "{}", w.text().join("\n"));
 }
 
 // a restart (a release) mid-race: the races go on in their players' browsers and count when the players report after

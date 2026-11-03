@@ -6,6 +6,7 @@
 import * as esbuild from 'esbuild';
 import fs from 'node:fs';
 import path from 'node:path';
+import { bootTexts } from './tools/i18n-keys.mjs';
 const watch = process.argv.includes('--watch');
 const DIST = 'dist', DEV = 'dist-dev';
 const opts = {
@@ -15,7 +16,7 @@ const opts = {
     'host/io-worker': 'src/host/io-worker.ts',
     'host/predownload-worker': 'src/host/predownload-worker.ts',
     'gpu/png-worker': 'src/gpu/png-worker.ts',
-    'net/net-worker': 'src/net/worker.ts',
+    'net/worker': 'src/net/worker.ts',
     'sw': 'src/sw.ts',
     'test/hostcheck': 'src/test/hostcheck.ts',
     'test/play': 'src/test/play.ts',
@@ -29,6 +30,9 @@ const opts = {
   loader: { '.txt': 'text', '.png': 'dataurl' },
 };
 for (const [k, v] of Object.entries(opts.entryPoints)) if (!fs.existsSync(v)) delete opts.entryPoints[k];
+// boot.js: what the start page says when main.js never starts (src/boot.ts), a classic script that runs before it,
+// with its few texts in every language (it cannot fetch a language file)
+const bootOpts = { ...opts, entryPoints: { boot: 'src/boot.ts' }, format: 'iife', define: { BOOT_TEXTS: JSON.stringify(bootTexts()) } };
 
 // test pages and source maps go to dist-dev (same relative path: /test/x.js, /main.js.map); the rest to dist
 const devOnly = rel => rel.startsWith('test/') || rel.endsWith('.map');
@@ -54,14 +58,35 @@ fs.rmSync(path.join(DIST, 'lang'), { recursive: true, force: true });
 fs.mkdirSync(path.join(DIST, 'lang'));
 for (const f of fs.readdirSync('src/app/lang')) if (f.endsWith('.json'))
   fs.writeFileSync(path.join(DIST, 'lang', f), JSON.stringify(JSON.parse(fs.readFileSync(path.join('src/app/lang', f), 'utf8'))));
-const page = name => `<!doctype html><meta charset=utf-8><title>${name}</title><script type=module src="/test/${name}.js"></script>`;
+// the changelog (CHANGELOG.md at the top of the repo): /changelog.json, fetched when a player opens it (changelog.ts):
+// [{ date, commit, changes: [[area, text]] }], newest first, one release a day.  A line that looks like a release or a
+// change but is neither stops the build, so a typo never reaches the page as a missing release; so does a day twice
+fs.writeFileSync(path.join(DIST, 'changelog.json'), JSON.stringify(changelog(fs.readFileSync('../CHANGELOG.md', 'utf8'))));
+function changelog(md) {
+  const out = [];
+  md.split(/\r?\n/).forEach((line, i) => {
+    const bad = what => { throw new Error(`CHANGELOG.md:${i + 1}: ${what}: ${line}`); };
+    let m;
+    if ((m = /^## (\d{4}-\d{2}-\d{2}) \(([0-9a-f]{7,40})\)$/.exec(line))) {
+      if (out.some(r => r.date === m[1])) bad("a day's releases share one section");
+      out.push({ date: m[1], commit: m[2], changes: [] });
+    }
+    else if (line.startsWith('#') && i > 0) bad('a release is "## <yyyy-mm-dd> (<commit>)"');
+    else if ((m = /^- (?:\*\*([^*]+):\*\* )?(\S.*)$/.exec(line))) (out.at(-1) ?? bad('a change before the first release')).changes.push([m[1] ?? '', m[2]]);
+    else if (/^\s+\S/.test(line) && out.at(-1)?.changes.length) out.at(-1).changes.at(-1)[1] += ' ' + line.trim();
+    else if (/^\s*[-*+]/.test(line)) bad('a change is "- **Area:** what changed"');
+  });
+  return out;
+}
+const page =name => `<!doctype html><meta charset=utf-8><title>${name}</title><script type=module src="/test/${name}.js"></script>`;
 for (const name of ['play', 'hostcheck', 'shadercheck', 'aicheck']) fs.writeFileSync(path.join(DEV, 'test', `${name}.html`), page(name));
 // the player's page takes its address's test parameters only from a server that serves this (--dev: shell.ts)
 fs.writeFileSync(path.join(DEV, 'test', 'dev.json'), '{"dev":true}\n');
 if (watch) {
-  const ctx = await esbuild.context({ ...opts, plugins: [{ name: 'emit', setup(b) { b.onEnd(r => { if (r.outputFiles) emit(r.outputFiles); }); } }] });
-  await ctx.watch();
+  for (const o of [opts, bootOpts]) {
+    const ctx = await esbuild.context({ ...o, plugins: [{ name: 'emit', setup(b) { b.onEnd(r => { if (r.outputFiles) emit(r.outputFiles); }); } }] });
+    await ctx.watch();
+  }
 } else {
-  const r = await esbuild.build(opts);
-  emit(r.outputFiles);
+  for (const o of [opts, bootOpts]) emit((await esbuild.build(o)).outputFiles);
 }

@@ -85,7 +85,7 @@ fn the_owner_takes_its_name_back() {
     assert_eq!(persona(&w, l), "Speedy");
     assert!(w.c(other).fin || w.c(other).reset, "the other session dropped");
     assert!(w.logged("the name's owner logged in"), "{:?}", w.text());
-    // playing holds the claim 180 days from now
+    // playing holds the claim HOLD_DAYS from now
     w.advance(10.0 * 86_400_000.0);
     let (_, _) = player(&mut w, "10.77.0.3", "Speedy", Some('A'));
     let m = claims.mine(&owner_of_token(&token('A')).unwrap(), now(&w)).unwrap();
@@ -115,7 +115,7 @@ fn messenger_lists_follow_the_claim() {
     assert_eq!(roster(&mut w, mc), ["Alpha"]);
     assert!(w.core.buddies.list("Charlie").unwrap().temp);
     w.core.buddy_save();
-    let text = std::fs::read_to_string(dir.join("buddies.json")).unwrap();
+    let text = crate::buddy::shelf_texts(&dir).join("\n");
     assert!(!text.contains("{\"name\":\"Charlie\""), "{text}");
     assert!(text.contains(&format!("\"owner\":\"{a}\"")), "{text}");
     w.send(mc, "DISC", vec![]);
@@ -159,7 +159,7 @@ fn lists_of_before_go_to_the_first_claim() {
     assert!(roster(&mut w, n).is_empty(), "NAME's shared list went");
     w.send(m, "DISC", vec![]);
     w.core.buddy_save();
-    let text = std::fs::read_to_string(dir.join("buddies.json")).unwrap();
+    let text = crate::buddy::shelf_texts(&dir).join("\n");
     assert!(text.contains("\"Delta\"") && !text.contains("\"NAME\"") && !text.contains("\"Player\""), "{text}");
     // its first keyphrase gets it, with its blocked list
     claims.claim("Delta", &owner_of_token(&token('D')).unwrap(), now(&w)).unwrap();
@@ -186,4 +186,137 @@ fn a_name_change_takes_the_lists_along() {
     assert!(w.core.buddies.list("Alpha").is_none());
     assert_eq!(roster(&mut w, mb), ["Speedy"]);
     assert!(w.logged("lists moved from \"alpha\""), "{:?}", w.text());
+}
+
+// free roam's pages befriend through the Messenger's lists, as their keyphrase's claimed name: a request waits on
+// both lists, a request back makes friends, and the Messenger hears of it; names nobody claimed take no part
+#[test]
+fn pages_befriend_through_the_messenger_lists() {
+    use crate::buddy::FriendAsk::{Answer, Ask, Block, List, Remove};
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("online");
+    let claims = Arc::new(Claims::in_memory());
+    let mut w = world_with(&claims, Some(dir.clone()));
+    let [a, b, c] = ['A', 'B', 'C'].map(|k| owner_of_token(&token(k)).unwrap());
+    for (n, o) in [("Alpha", &a), ("Bravo", &b), ("Charlie", &c)] {
+        claims.claim(n, o, now(&w)).unwrap();
+    }
+    let g: Arc<str> = Arc::from("g1");
+    let names = |r: &crate::buddy::FriendReply| r.friends.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+    // Alpha's Messenger is open: it hears of Bravo's request
+    let (_, ma) = player(&mut w, "10.77.0.2", "Alpha", Some('A'));
+    let r = w.core.friends(&b, &g, Ask("Alpha".into()));
+    assert_eq!((r.me.as_deref(), r.done, r.sent.clone()), (Some("Bravo"), "asked", vec!["Alpha".to_string()]));
+    w.deliver();
+    assert_eq!(w.c(ma).l("RNOT").g("ATTR"), "R");
+    assert_eq!(w.core.friends(&a, &g, List).asks, ["Bravo"]);
+    // asked back: friends, each on the other's list, the Messenger told
+    let r = w.core.friends(&a, &g, Ask("Bravo".into()));
+    assert_eq!((r.done, names(&r), r.asks.len()), ("friends", vec!["Bravo".to_string()], 0));
+    assert_eq!(roster(&mut w, ma), ["Bravo"]);
+    let r = w.core.friends(&b, &g, List);
+    assert_eq!(r.friends, [crate::buddy::FriendRow { name: "Alpha".into(), online: true, contact: None }]);
+    assert_eq!(w.core.friends(&b, &g, Ask("Alpha".into())).done, "friends", "already");
+    // what takes no part: oneself, a name nobody claimed, a keyphrase without a name
+    assert_eq!(w.core.friends(&a, &g, Ask("alpha".into())).done, "self");
+    assert_eq!(w.core.friends(&a, &g, Ask("Delta".into())).done, "claim");
+    let r = w.core.friends(&owner_of_token(&token('D')).unwrap(), &g, List);
+    assert_eq!((r.me, r.done), (None, "claim"));
+    // a request declined goes from both lists
+    assert_eq!(w.core.friends(&c, &g, Ask("Alpha".into())).done, "asked");
+    assert_eq!(w.core.friends(&a, &g, Answer("Charlie".into(), false)).done, "ok");
+    assert!(w.core.friends(&c, &g, List).sent.is_empty() && w.core.friends(&a, &g, List).asks.is_empty());
+    assert_eq!(w.core.friends(&a, &g, Answer("Charlie".into(), true)).done, "none", "nothing to answer");
+    // blocked: its requests never arrive
+    assert_eq!(w.core.friends(&a, &g, Block("Charlie".into())).done, "ok");
+    assert_eq!(w.core.friends(&c, &g, Ask("Alpha".into())).done, "asked");
+    assert!(w.core.friends(&a, &g, List).asks.is_empty());
+    // over a restart: the friends are kept
+    w.core.stop();
+    let mut w = world_with(&claims, Some(dir.clone()));
+    assert_eq!(names(&w.core.friends(&a, &g, List)), ["Bravo"]);
+    // friends no more, on neither list
+    assert_eq!(w.core.friends(&b, &g, Remove("Alpha".into())).done, "ok");
+    assert!(w.core.friends(&a, &g, List).friends.is_empty() && w.core.friends(&b, &g, List).friends.is_empty());
+    assert_eq!(w.core.friends(&b, &g, Remove("Alpha".into())).done, "none");
+}
+
+// friends message each other from their pages: to the Messenger of a friend logged in there, else to its pages (the
+// server's hook), else the message waits and the friend's page takes it with its list; the Messenger's own messages
+// to a friend who is away reach its pages too; strangers, empty messages and slurs reach no one
+#[test]
+fn pages_message_friends() {
+    use crate::buddy::FriendAsk::{Ask, List, ListMail, Send};
+    use crate::buddy::PageMail;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let claims = Arc::new(Claims::in_memory());
+    let mut w = world_with(&claims, None);
+    let [a, b, c] = ['A', 'B', 'C'].map(|k| owner_of_token(&token(k)).unwrap());
+    for (n, o) in [("Alpha", &a), ("Bravo", &b), ("Charlie", &c)] {
+        claims.claim(n, o, now(&w)).unwrap();
+    }
+    let g: Arc<str> = Arc::from("g1");
+    assert_eq!(w.core.friends(&a, &g, Ask("Bravo".into())).done, "asked");
+    assert_eq!(w.core.friends(&b, &g, Ask("Alpha".into())).done, "friends");
+    // the pages: what they took, and whether one is open
+    let got: Arc<Mutex<Vec<(String, PageMail)>>> = Arc::default();
+    let open = Arc::new(AtomicBool::new(true));
+    let (got2, open2) = (got.clone(), open.clone());
+    w.core.set_page_mail(Box::new(move |to, m| {
+        let on = open2.load(Ordering::SeqCst);
+        if on {
+            got2.lock().unwrap().push((to.to_string(), m.clone()));
+        }
+        on
+    }));
+    // Bravo's page is open: it gets the message now, cut to 120 characters
+    let long = "x".repeat(200);
+    assert_eq!(w.core.friends(&a, &g, Send("bravo".into(), format!("  hi\u{0007} there  {long}"))).done, "sent");
+    {
+        let got = got.lock().unwrap();
+        assert_eq!((got.len(), got[0].0.as_str(), got[0].1.from.as_str()), (1, "Bravo", "Alpha"));
+        assert!(got[0].1.body.starts_with("hi there xxx") && got[0].1.body.chars().count() == 120, "{:?}", got[0].1.body);
+    }
+    assert!(w.logged("\"Alpha\" sent \"Bravo\" a message (got it)"), "{:?}", w.text());
+    // no page open: it waits, and Bravo's page takes it with its list, once
+    open.store(false, Ordering::SeqCst);
+    assert_eq!(w.core.friends(&a, &g, Send("Bravo".into(), "race later?".into())).done, "kept");
+    assert!(w.core.friends(&b, &g, List).mail.is_empty(), "a plain list leaves them");
+    let r = w.core.friends(&b, &g, ListMail);
+    assert_eq!(r.mail.iter().map(|m| (m.from.as_str(), m.body.as_str())).collect::<Vec<_>>(), [("Alpha", "race later?")]);
+    assert!(w.core.friends(&b, &g, ListMail).mail.is_empty());
+    // Bravo's Messenger is open: the message goes there (RECV), not to the pages
+    open.store(true, Ordering::SeqCst);
+    let (_, mb) = player(&mut w, "10.77.0.3", "Bravo", Some('B'));
+    w.deliver();
+    assert_eq!(w.core.friends(&a, &g, Send("Bravo".into(), "on my way".into())).done, "sent");
+    w.deliver();
+    let m = w.c(mb).l("RECV");
+    assert_eq!((m.g("USER"), m.g("BODY")), ("Alpha", "on my way"));
+    assert_eq!(got.lock().unwrap().len(), 1);
+    // the Messenger's own message to Alpha, who is not in it: to Alpha's pages
+    w.send(mb, "SEND", fields![("USER", "Alpha"), ("BODY", "see you"), ("SUBJ", ""), ("TYPE", "C")]);
+    {
+        let got = got.lock().unwrap();
+        assert_eq!((got.len(), got[1].0.as_str(), got[1].1.from.as_str(), got[1].1.body.as_str()), (2, "Alpha", "Bravo", "see you"));
+    }
+    // what reaches no one: a stranger's, an empty one, one without a claimed name
+    assert_eq!(w.core.friends(&c, &g, Send("Alpha".into(), "hey".into())).done, "none");
+    assert_eq!(w.core.friends(&a, &g, Send("Bravo".into(), " \u{0007} ".into())).done, "empty");
+    assert_eq!(w.core.friends(&owner_of_token(&token('D')).unwrap(), &g, Send("Alpha".into(), "hey".into())).done, "claim");
+    // one that reads as a slur goes to no one (its sender sees it go); the third in the window turns them off
+    let n = got.lock().unwrap().len();
+    for _ in 0..3 {
+        assert_eq!(w.core.friends(&b, &g, Send("Alpha".into(), "SIEG HEIL".into())).done, "sent");
+    }
+    assert_eq!(got.lock().unwrap().len(), n);
+    assert!(w.logged("\"Bravo\": a message with \"SIEG HEIL\" in it, sent to no one; messages off for 600 s"), "{:?}", w.text());
+    assert_eq!(w.core.friends(&b, &g, Send("Alpha".into(), "sorry".into())).done, "off");
+    // the Messenger's too
+    w.send(mb, "SEND", fields![("USER", "Alpha"), ("BODY", "sorry"), ("SUBJ", ""), ("TYPE", "C")]);
+    assert_eq!(got.lock().unwrap().len(), n);
+    w.advance(600_001.0);
+    assert_eq!(w.core.friends(&b, &g, Send("Alpha".into(), "sorry".into())).done, "sent");
+    assert_eq!(got.lock().unwrap().len(), n + 1);
 }

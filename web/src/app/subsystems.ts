@@ -10,7 +10,7 @@ import { attachRenderer as gpuAttach } from '../gpu/index';
 export { OtherBuild } from '../gpu/index';
 import { attachAudio as audioAttach } from '../audio/index';
 import { attachInput as inputAttach } from '../input/index';
-import { attachNet as netAttach } from '../net/remote';
+import { attachNetWorker as netAttach } from '../net/remote';
 import type { AttachAudio, AttachInput, AttachNet, AttachRenderer } from './contract';
 
 export type {
@@ -23,7 +23,10 @@ export const attachRenderer: AttachRenderer = async (proc, canvas, o) => {
   return {
     detach: () => r.detach(),
     imageRect: () => r.imageRect(),
-    dump: (name: string) => r.dump(name),
+    dump: (name: string, mark?: boolean) => r.dump(name, mark),
+    photo: (name: string, mark?: boolean) => r.photo(name, mark),
+    photoLook: look => r.photoLook(look),
+    photoProgress: () => r.photoProgress(),
     doneMs: () => r.doneMs(),
     textures: () => { const s = r.stats(); return { bytes: s.texBytes, unpacked: s.unpackBytes, astc: s.astcBytes }; },
     stats: () => {
@@ -42,8 +45,8 @@ export const attachInput: AttachInput = (proc, element, o) =>
   inputAttach(proc, element, { log: o.log, viewRect: o.viewRect, toggleFullscreen: o.toggleFullscreen, padPage: o.padPage });
 
 export const attachNet: AttachNet = (proc, o) => {
-  const link = netAttach(proc, { name: o.name, id: o.id, was: o.was, claim: o.claim, block: o.block, log: o.log, onNotice: o.notice, onLobby: o.lobby, onSay: o.say, onBack: o.back,
-    onQueue: o.queue, onRemoved: o.removed });
+  const link = netAttach(proc, { name: o.name, id: o.id, was: o.was, claim: o.claim, block: o.block, log: o.log, onNotice: o.notice, onLobby: o.lobby, onSay: o.say, onBump: o.bump, onBattle: o.battle, onFriend: o.friend, onBack: o.back,
+    onQueue: o.queue, onRemoved: o.removed, onRaces: o.races, onRename: o.rename });
   const friends = () => link.peers.filter(p => !p.self);
   return {
     detach: () => link.close(),
@@ -52,11 +55,12 @@ export const attachNet: AttachNet = (proc, o) => {
     holding: () => link.state === 'connecting' || link.state === 'online' || link.state === 'offline' || link.state === 'queued',
     away: (on: boolean) => link.setAway(on),
     offline: () => link.goOffline(),
-    solid: (on: boolean) => link.setSolid(on),
-    say: (p: number) => link.say(p),
+    rename: (name: string) => link.rename(name),
+    solid: (collide: 'on' | 'off' | 'none') => link.setSolid(collide),
+    say: (p: number, race?: boolean) => link.say(p, race),
+    friend: (m: Record<string, unknown>) => link.friend(m),
     crews: (hashes: readonly number[], rgbs: readonly number[]) => link.setCrews(hashes, rgbs),
     room: (name: string) => link.setRoom(name),
-    canRoom: () => link.canRoom(),
     stats: () => {
       const s = link.stats();
       return { 'lan online': s.state === 'online' ? 1 : 0, 'lan friends': friends().length, 'lan rtt ms': s.switchRttMs };

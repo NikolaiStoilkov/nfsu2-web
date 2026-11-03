@@ -12,6 +12,8 @@
 // - renaming a profile (profile.ts renameProfile) moves its folder, file and
 //   cover shoots, changes the name inside and the two checksums it moves, and
 //   nothing else; a refused rename, or one that fails halfway, leaves the saves as they were
+// - a first profile's name field starts with Your name's letters and digits (profile.ts newProfileName), never NAME,
+//   Player or a slur
 // The profiles here are synthetic (the layout of profile.ts's header comment).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -61,29 +63,29 @@ test('checksum: CRC-32/BZIP2 but the last 4 bytes, XOR them (the catalogue check
 });
 
 test('the Save option of a profile the checks accept', () => {
-  assert.deepEqual(mode(profile('THOM', 0, 1), 'THOM'), { mode: 'prompt' });
-  assert.deepEqual(mode(profile('THOM', 1, 1), 'THOM'), { mode: 'autosave' });
-  assert.deepEqual(mode(profile('THOM', 1, 0), 'THOM'), { mode: 'autosave' });
-  assert.deepEqual(mode(profile('THOM', 0, 0), 'THOM'), { mode: 'off' });
-  assert.deepEqual(mode(profile('Thom', 0, 1), 'THOM'), { mode: 'prompt' }, 'the name in any case');
+  assert.deepEqual(mode(profile('TOBI', 0, 1), 'TOBI'), { mode: 'prompt' });
+  assert.deepEqual(mode(profile('TOBI', 1, 1), 'TOBI'), { mode: 'autosave' });
+  assert.deepEqual(mode(profile('TOBI', 1, 0), 'TOBI'), { mode: 'autosave' });
+  assert.deepEqual(mode(profile('TOBI', 0, 0), 'TOBI'), { mode: 'off' });
+  assert.deepEqual(mode(profile('Tobi', 0, 1), 'TOBI'), { mode: 'prompt' }, 'the name in any case');
 });
 
 test('a file the checks refuse is never changed', () => {
-  const bad = (f, name = 'THOM') => { const r = mode(f, name); assert.ok('bad' in r, JSON.stringify(r)); return r.bad; };
-  const good = profile('THOM');
+  const bad = (f, name = 'TOBI') => { const r = mode(f, name); assert.ok('bad' in r, JSON.stringify(r)); return r.bad; };
+  const good = profile('TOBI');
   assert.match(bad(good.subarray(0, 54965)), /54965 bytes/);
   const magic = Buffer.from(good); magic[0] = 0x33; assert.match(bad(seal(magic)), /20CM/);
   const edited = Buffer.from(good); edited[100] ^= 1; assert.match(bad(edited), /checksums/);    // a save editor's money change
   const head = Buffer.from(good); head[24] ^= 1; assert.match(bad(head), /checksums/);
-  assert.match(bad(profile('THOM', 0, 1, { version: 0x10C })), /version/);
+  assert.match(bad(profile('TOBI', 0, 1, { version: 0x10C })), /version/);
   assert.match(bad(good, 'OTHER'), /name inside/);
-  assert.match(bad(profile('THOM', 2, 1)), /Save bytes/);
-  assert.match(bad(profile('THOM', 0, 255)), /Save bytes/);
+  assert.match(bad(profile('TOBI', 2, 1)), /Save bytes/);
+  assert.match(bad(profile('TOBI', 0, 255)), /Save bytes/);
 });
 
 test('withAutosave changes the two Save bytes and the checksums they move, nothing else', () => {
-  const f = profile('THOM', 0, 1), g = P.withAutosave(f);
-  assert.deepEqual(mode(g, 'THOM'), { mode: 'autosave' });
+  const f = profile('TOBI', 0, 1), g = P.withAutosave(f);
+  assert.deepEqual(mode(g, 'TOBI'), { mode: 'autosave' });
   const changed = [];
   for (let i = 0; i < f.length; i++) if (f[i] !== g[i]) changed.push(i);
   assert.ok(changed.every(i => (i >= 20 && i < 28) || i === 36 + 50987), `changed bytes ${changed}`);
@@ -112,37 +114,37 @@ const at = n => `${DIR}/${n}/${n}`;
 test('each profile is set once, and a choice made in the game afterwards stays', async () => {
   const corrupt = Buffer.from(profile('BROKEN')); corrupt[500] ^= 0xff;
   const fs = folder({
-    [at('THOM')]: profile('THOM', 0, 1), [at('OFFP')]: profile('OFFP', 0, 0), [at('AUTO')]: profile('AUTO', 1, 1),
-    [at('BROKEN')]: corrupt, 'registry.txt': 'NotFirstTime=1\n', [`${DIR}/THOM/notes.txt`]: 'x', [`${DIR}/EMPTY/other`]: 'y',
+    [at('TOBI')]: profile('TOBI', 0, 1), [at('OFFP')]: profile('OFFP', 0, 0), [at('AUTO')]: profile('AUTO', 1, 1),
+    [at('BROKEN')]: corrupt, 'registry.txt': 'NotFirstTime=1\n', [`${DIR}/TOBI/notes.txt`]: 'x', [`${DIR}/EMPTY/other`]: 'y',
   });
   const r1 = await P.turnOnAutosave(fs, DIR);
-  assert.deepEqual(r1.turnedOn, ['THOM']);
-  assert.deepEqual(mode(fs.m.get(at('THOM')), 'THOM'), { mode: 'autosave' });
+  assert.deepEqual(r1.turnedOn, ['TOBI']);
+  assert.deepEqual(mode(fs.m.get(at('TOBI')), 'TOBI'), { mode: 'autosave' });
   assert.deepEqual(mode(fs.m.get(at('OFFP')), 'OFFP'), { mode: 'off' }, 'Off is a choice: left');
   assert.equal(fs.m.get(at('BROKEN')), corrupt, 'a refused file is not written');
   assert.ok(r1.notes.some(n => /^BROKEN left as it is: .*checksums/.test(n)), r1.notes.join('\n'));
-  assert.deepEqual(fs.writes.sort(), [P.AUTOSAVE_SEEN, at('THOM')].sort());
+  assert.deepEqual(fs.writes.sort(), [P.AUTOSAVE_SEEN, at('TOBI')].sort());
   const seen = () => fs.m.get(P.AUTOSAVE_SEEN).split('\n').filter(l => l && !l.startsWith('#'));
-  assert.deepEqual(seen(), ['AUTO', 'OFFP', 'THOM'], 'BROKEN is looked at again next time');
+  assert.deepEqual(seen(), ['AUTO', 'OFFP', 'TOBI'], 'BROKEN is looked at again next time');
 
   // the player picks Prompt in the game: the game writes the profile with prompt, and it stays so
-  fs.m.set(at('THOM'), profile('THOM', 0, 1));
+  fs.m.set(at('TOBI'), profile('TOBI', 0, 1));
   fs.writes.length = 0;
   const r2 = await P.turnOnAutosave(fs, DIR);
   assert.deepEqual(r2.turnedOn, []);
   assert.deepEqual(fs.writes, [], 'nothing changed, nothing written');
-  assert.deepEqual(mode(fs.m.get(at('THOM')), 'THOM'), { mode: 'prompt' });
+  assert.deepEqual(mode(fs.m.get(at('TOBI')), 'TOBI'), { mode: 'prompt' });
 
-  // BROKEN saved again by the game (its checksums hold now), OFFP deleted, a new THOM after a delete
+  // BROKEN saved again by the game (its checksums hold now), OFFP deleted, a new TOBI after a delete
   fs.m.set(at('BROKEN'), profile('BROKEN', 0, 1));
   fs.m.delete(at('OFFP'));
   const r3 = await P.turnOnAutosave(fs, DIR);
   assert.deepEqual(r3.turnedOn, ['BROKEN']);
-  assert.deepEqual(seen(), ['AUTO', 'BROKEN', 'THOM']);
-  fs.m.delete(at('THOM'));
+  assert.deepEqual(seen(), ['AUTO', 'BROKEN', 'TOBI']);
+  fs.m.delete(at('TOBI'));
   await P.turnOnAutosave(fs, DIR);
-  fs.m.set(at('THOM'), profile('THOM', 0, 1));
-  assert.deepEqual((await P.turnOnAutosave(fs, DIR)).turnedOn, ['THOM'], 'a new profile of a deleted one\'s name');
+  fs.m.set(at('TOBI'), profile('TOBI', 0, 1));
+  assert.deepEqual((await P.turnOnAutosave(fs, DIR)).turnedOn, ['TOBI'], 'a new profile of a deleted one\'s name');
 });
 
 test('no profiles: nothing is written', async () => {
@@ -169,13 +171,13 @@ const cover = () => { const c = new Uint8Array(1048612); c.set([0x32, 0x30, 0x43
 test('a rename moves the profile, its cover shoots and its autosave line, and changes the name inside', async () => {
   const dvd = cover(), mag = cover();
   const fs = folder({
-    [at('THOM')]: profile('THOM', 0, 0), [`${DIR}/THOM/notes.txt`]: 'x', [`${DIR}/THOM DVD 1/THOM DVD 1`]: dvd,
-    [`${DIR}/THOM Magazine 12/THOM Magazine 12`]: mag, [at('AUTO')]: profile('AUTO', 1, 1), [`${DIR}/AUTO DVD 1/AUTO DVD 1`]: cover(),
-    [P.AUTOSAVE_SEEN]: '# head\nAUTO\nTHOM\nTHOMAS\n', 'registry.txt': 'r',
+    [at('TOBI')]: profile('TOBI', 0, 0), [`${DIR}/TOBI/notes.txt`]: 'x', [`${DIR}/TOBI DVD 1/TOBI DVD 1`]: dvd,
+    [`${DIR}/TOBI Magazine 12/TOBI Magazine 12`]: mag, [at('AUTO')]: profile('AUTO', 1, 1), [`${DIR}/AUTO DVD 1/AUTO DVD 1`]: cover(),
+    [P.AUTOSAVE_SEEN]: '# head\nAUTO\nTOBI\nTOBIAS\n', 'registry.txt': 'r',
   });
   const before = new Map(fs.m);
-  assert.deepEqual(await P.renameProfile(fs, DIR, 'THOM', 'Bob7'), { files: 4 });
-  const f = before.get(at('THOM')), g = fs.m.get(at('Bob7'));
+  assert.deepEqual(await P.renameProfile(fs, DIR, 'TOBI', 'Bob7'), { files: 4 });
+  const f = before.get(at('TOBI')), g = fs.m.get(at('Bob7'));
   assert.deepEqual(mode(g, 'Bob7'), { mode: 'off' }, 'the checks hold under the new name, the Save option as it was');
   assert.equal(name(g), 'Bob7');
   const changed = [];
@@ -184,17 +186,17 @@ test('a rename moves the profile, its cover shoots and its autosave line, and ch
   assert.equal(new TextDecoder().decode(fs.m.get(`${DIR}/Bob7/notes.txt`)), 'x');
   assert.equal(fs.m.get(`${DIR}/Bob7 DVD 1/Bob7 DVD 1`), dvd);
   assert.equal(fs.m.get(`${DIR}/Bob7 Magazine 12/Bob7 Magazine 12`), mag);
-  assert.equal(fs.m.get(P.AUTOSAVE_SEEN), '# head\nAUTO\nBob7\nTHOMAS\n');
-  assert.ok(![...fs.m.keys()].some(k => k.startsWith(`${DIR}/THOM`)), [...fs.m.keys()].join('\n'));
+  assert.equal(fs.m.get(P.AUTOSAVE_SEEN), '# head\nAUTO\nBob7\nTOBIAS\n');
+  assert.ok(![...fs.m.keys()].some(k => k.startsWith(`${DIR}/TOBI`)), [...fs.m.keys()].join('\n'));
   for (const k of [at('AUTO'), `${DIR}/AUTO DVD 1/AUTO DVD 1`, 'registry.txt']) assert.equal(fs.m.get(k), before.get(k), `${k} untouched`);
   assert.equal(fs.writes.findIndex(w => w.startsWith('-')), fs.writes.length - 3, 'the old folders go last');
 });
 
 test('a change of case only is a rename; a longer name inside is cleared', async () => {
-  const fs = folder({ [at('thom')]: profile('thom', 1, 1, { inside: 'THOM' }) });
-  assert.deepEqual(await P.renameProfile(fs, DIR, 'thom', 'Thom'), { files: 1 });
-  assert.deepEqual([...fs.m.keys()], [at('Thom')]);
-  assert.deepEqual(mode(fs.m.get(at('Thom')), 'Thom'), { mode: 'autosave' });
+  const fs = folder({ [at('tobi')]: profile('tobi', 1, 1, { inside: 'TOBI' }) });
+  assert.deepEqual(await P.renameProfile(fs, DIR, 'tobi', 'Tobi'), { files: 1 });
+  assert.deepEqual([...fs.m.keys()], [at('Tobi')]);
+  assert.deepEqual(mode(fs.m.get(at('Tobi')), 'Tobi'), { mode: 'autosave' });
   const fs2 = folder({ [at('ABCDEFG')]: profile('ABCDEFG') });
   await P.renameProfile(fs2, DIR, 'ABCDEFG', 'X');
   const g = fs2.m.get(at('X'));
@@ -220,30 +222,45 @@ test('a profile the game named with stale heap bytes gets a name again', async (
   assert.deepEqual(mode(g, 'NAME2'), { mode: 'autosave' });
 });
 
+test('a profile named with the Chinese new-profile box\'s own text, or another name inside than its folder\'s, gets a name again', async () => {
+  // the box starts with D6 8B 89 (LANGPACKS/chinese's NAME), the field keeps what is typed after it; the I/O worker
+  // makes the folder of the path's UTF-8 (U+058B, U+FFFD)
+  const zh = Buffer.from([0xd6, 0x8b, 0x89]).toString('latin1') + 'ads', dir = new TextDecoder().decode(Buffer.from(zh, 'latin1'));
+  const fs = folder({ [at(dir)]: profile('X', 1, 1, { inside: zh }), [`${DIR}/${dir}/GARAGE.DAT`]: 'g', [at('KEI')]: profile('X', 0, 1, { inside: 'OTHER' }) });
+  assert.deepEqual(mode(fs.m.get(at(dir)), dir), { mode: 'autosave' }, 'the page\'s own checks take it as it is');
+  assert.deepEqual(await P.renameProfile(fs, DIR, dir, 'ads'), { files: 2 });
+  assert.equal(name(fs.m.get(at('ads'))), 'ads');
+  assert.equal(new TextDecoder().decode(fs.m.get(`${DIR}/ads/GARAGE.DAT`)), 'g', 'slots 6-10 with it');
+  assert.match(mode(fs.m.get(at('KEI')), 'KEI').bad ?? '', /name inside is "OTHER"/, 'Autosave leaves it alone');
+  assert.deepEqual(await P.renameProfile(fs, DIR, 'KEI', 'KEI2'), { files: 1 }, 'a rename mends it');
+  assert.deepEqual(mode(fs.m.get(at('KEI2')), 'KEI2'), { mode: 'prompt' });
+  assert.deepEqual([...fs.m.keys()].sort(), [at('KEI2'), `${DIR}/ads/GARAGE.DAT`, at('ads')].sort());
+});
+
 test('a refused rename writes nothing', async () => {
   const corrupt = Buffer.from(profile('BROKEN')); corrupt[500] ^= 0xff;
-  const files = { [at('THOM')]: profile('THOM'), [at('AUTO')]: profile('AUTO'), [at('BROKEN')]: corrupt, [`${DIR}/NEW DVD 2/NEW DVD 2`]: cover() };
+  const files = { [at('TOBI')]: profile('TOBI'), [at('AUTO')]: profile('AUTO'), [at('BROKEN')]: corrupt, [`${DIR}/NEW DVD 2/NEW DVD 2`]: cover() };
   const refused = async (from, to, re) => {
     const fs = folder(files);
     const r = await P.renameProfile(fs, DIR, from, to);
     assert.match(r.refused ?? '', re, `${from} -> ${to}: ${JSON.stringify(r)}`);
     assert.deepEqual(fs.writes, []);
   };
-  for (const bad of ['', 'ABCDEFGH', 'A B', 'A-B', 'Thé', 'A/B', '..']) await refused('THOM', bad, /1 to 7 letters and digits/);
-  await refused('THOM', 'auto', /There is a profile AUTO already/);
-  await refused('THOM', 'new', /cover shoot NEW DVD 2/);
+  for (const bad of ['', 'ABCDEFGH', 'A B', 'A-B', 'Thé', 'A/B', '..']) await refused('TOBI', bad, /1 to 7 letters and digits/);
+  await refused('TOBI', 'auto', /There is a profile AUTO already/);
+  await refused('TOBI', 'new', /cover shoot NEW DVD 2/);
   await refused('BROKEN', 'FIXED', /BROKEN cannot be renamed here: its checksums/);
   await refused('NOBODY', 'X', /no profile NOBODY/);
-  assert.deepEqual(await P.renameProfile(folder(files), DIR, 'THOM', 'THOM'), { files: 0 });
+  assert.deepEqual(await P.renameProfile(folder(files), DIR, 'TOBI', 'TOBI'), { files: 0 });
 });
 
 test('a rename that fails halfway leaves the profile as it was', async () => {
-  const fs = folder({ [at('THOM')]: profile('THOM'), [`${DIR}/THOM DVD 1/THOM DVD 1`]: cover() });
+  const fs = folder({ [at('TOBI')]: profile('TOBI'), [`${DIR}/TOBI DVD 1/TOBI DVD 1`]: cover() });
   const before = new Map(fs.m);
   const write = fs.writeFile;
   let n = 0;
   fs.writeFile = async (p, d) => { if (++n === 2) throw new Error('disk full'); return write(p, d); };
-  await assert.rejects(P.renameProfile(fs, DIR, 'THOM', 'BOB'), /disk full/);
+  await assert.rejects(P.renameProfile(fs, DIR, 'TOBI', 'BOB'), /disk full/);
   assert.deepEqual([...fs.m.keys()].sort(), [...before.keys()].sort());
   for (const [k, v] of before) assert.equal(fs.m.get(k), v);
 });
@@ -252,4 +269,11 @@ test('cover shoots are told from profiles by their folder name', () => {
   assert.deepEqual(P.coverOf('CLAUDE DVD 1'), { profile: 'CLAUDE', cover: 'DVD 1' });
   assert.deepEqual(P.coverOf('A B Magazine 10'), { profile: 'A B', cover: 'Magazine 10' });
   for (const f of ['CLAUDE', 'DVD 1', 'CLAUDE DVD', 'CLAUDE dvd 1', 'CLAUDE DVD 1x']) assert.equal(P.coverOf(f), null, f);
+});
+
+test('a first profile\'s name field starts with Your name, as the game\'s field takes it', () => {
+  const cases = [['Alex', 'Alex'], ['Alex_the_Great', 'Alexthe'], ['Dani-99', 'Dani99'], ['RapidRacer', 'RapidRa'],
+    ['NAME', ''], ['player', ''], ['N_A_M_E', ''], ['__', ''], ['', ''], ['Nigger', ''], ['N-i-g-g-e-r', '']];
+  for (const [i, o] of cases) assert.equal(P.newProfileName(i), o, JSON.stringify(i));
+  for (const [, o] of cases) if (o) assert.ok(P.isProfileName(o), o);
 });

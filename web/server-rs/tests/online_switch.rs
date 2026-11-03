@@ -62,7 +62,9 @@ async fn switch_the_online_host_on_the_peer_list_frames_to_it_and_back_no_broadc
     let s = start_with(LanOptions::default(), Some(online.clone() as Arc<dyn Host>), None).await;
     let send = s.lan.switch_send();
     let a = Browser::open(s.port, "", None).await;
+    a.hello("Ann");
     let b = Browser::open(s.port, "", None).await;
+    b.hello("Bob");
     let peers = a.until(|g| g.peers().filter(|l| l.len() == 3)).await;
     let servers: Vec<(u64, &str)> =
         peers.iter().filter(|p| p["server"] == true).map(|p| (p["vip"].as_u64().unwrap(), p["name"].as_str().unwrap())).collect();
@@ -313,6 +315,7 @@ async fn measure_the_online_hosts_queue_behind_a_slow_thread() {
             std::thread::sleep(std::time::Duration::from_micros(100));
         })),
         claims: None,
+        deny: None,
     });
     let sw = start(LanOptions { max_peers: 2000, max_payload: 1 << 20, ..LanOptions::default() }, Some(online.clone()), None).await;
     let mut floods = Vec::new();

@@ -8,7 +8,9 @@
 //!   of characters one _, at most 15, as runtime/online.c makes the game's name), in any case.
 //! - The game's names for nobody in particular ([`UNCLAIMABLE`]: NAME, the default profile name that hundreds of
 //!   players keep, and Player) and a name that reads as a slur (nfsu2-names) are never claimed.
-//! - A claim holds [`HOLD_DAYS`] after its owner last played under it ([`Claims::seen`]).
+//! - A claim lasts as long as its keyphrase: [`HOLD_DAYS`] after its owner last played under it ([`Claims::seen`]) or
+//!   used the keyphrase ([`Claims::used`]: its cloud saves read or saved), as long as nfsu2-vault keeps a keyphrase
+//!   nobody uses.
 //! - One name a keyphrase.  Claiming another is a change: the first is free, then one every [`CHANGE_DAYS`]; the
 //!   name before stays the owner's for [`GRACE_DAYS`] more (its friends still have it on their lists for a while).
 //! - The owner is a keyphrase, by a hash of its token ([`owner_of_token`]): the page sends the token where it claims
@@ -32,8 +34,9 @@ use sha2::{Digest, Sha256};
 mod tests;
 
 pub const DAY_MS: i64 = 86_400_000;
-/// a claim holds this long after its owner last played under it
-pub const HOLD_DAYS: i64 = 180;
+/// a claim holds this long after its owner last played under it or used its keyphrase: as long as nfsu2-vault keeps a
+/// keyphrase nobody uses (`VaultOptions::unused_ms`, two years)
+pub const HOLD_DAYS: i64 = 730;
 /// at most one change of name in this many days (the first is free)
 pub const CHANGE_DAYS: i64 = 7;
 /// the name before a change stays its owner's this long
@@ -371,6 +374,18 @@ impl Claims {
         }
     }
 
+    /// `owner`'s keyphrase was used (its cloud saves read or saved, /vault): the claim of its current name holds
+    /// `HOLD_DAYS` from now, as the keyphrase does
+    pub fn used(&self, owner: &str, now: i64) {
+        let name = {
+            let g = self.inner.read();
+            g.current(owner, now).map(|k| g.names[k].name.clone())
+        };
+        if let Some(name) = name {
+            self.seen(&name, owner, now);
+        }
+    }
+
     /// a keyphrase gone from the cloud: its names are free.  How many there were.
     pub fn release(&self, owner: &str) -> usize {
         let mut g = self.inner.write();
@@ -516,7 +531,7 @@ impl Claims {
 }
 
 /// the folder (0700 when it is made), a temporary file (0600), then the rename over `file`
-fn write_atomic(file: &Path, body: &[u8]) -> Result<(), String> {
+pub fn write_atomic(file: &Path, body: &[u8]) -> Result<(), String> {
     let dir = file.parent().ok_or("no folder")?;
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true);

@@ -24,7 +24,7 @@ and it says something only when it is worth it:
 
 - **when a fix goes live**, in a thread whose problem one of the release's commits fixes: that a fix may have solved
   it, what the fix changes (one plain sentence, no internals), to reload the page, and to post a new log if it still
-  happens. Only when a full look at the thread is sure; at most once a thread, at most 3 threads a release (short,
+  happens. Only when a full look at the thread is sure; at most once a thread, at most 15 threads a release (short,
   low-effort looks), threads of the last 14 days, also threads staff wrote in (one the bot never looked at is matched
   by its title and first post). A report about the thread turns ✅ Fixed.
 
@@ -36,6 +36,9 @@ and it says something only when it is worth it:
   two sentences on what it adds, once a thread, and the thread stays open. Old suggestions count
   too: at each release the bot reads the suggestion forums' threads, archived ones included (the newest 500 of each),
   and keeps them a year. Suggestions tagged Complete or Denied, or locked, are left out.
+  At start and every 3 hours it also counts each suggestion's votes, for the developer: the reactions on its first
+  post and Discord's count of the thread's messages and people (`votes`, `messages`, `members` in `state/threads.json`;
+  the model doesn't see them).
 
 - **in the general channels** (text channels named `general…`), sparingly: someone who reports a problem of their own
   there, and whom nobody helps within 4 minutes, gets one short reply in their language. When the problem is
@@ -70,6 +73,16 @@ and it says something only when it is worth it:
   people translate it, and a thread's language is kept too, so later translations in it send no other messages
   along. At most 30 new translations a person an hour.
 
+- **The FAQ**, for a read-only channel: `/faq` (only for those who can manage the server) posts one message there,
+  the questions players ask most as buttons under their topics; a button's answer is seen only by the one who
+  pressed it. The questions and answers are `faq.md` (the file says how to write it); the bot reads it from its clone,
+  so a pushed change shows in the posted message within minutes, and `/faq` again in that channel brings it up to
+  date at once. A version Discord would refuse (a label over 80 characters, more than 40 parts) keeps the one before
+  it, and the log says why. An answer goes to each reader in their Discord language: one short Haiku call the first
+  time someone of that language presses it, given the page's own words for the buttons and settings it names
+  (`web/src/app/lang`), then kept in `state/faq-translations.json` until the answer changes. English readers get
+  `faq.md` as it is.
+
 - **Forum tags**: each look adds the forum's tags that say what the thread is about, at most two (the problem, and the
   device when it is a phone or tablet), picked from the forum's tags but the five below, the moderated ones and
   Denied. Five it keeps itself, by name, in a forum that has them: **Needs info** while its last reply asked the poster
@@ -80,7 +93,7 @@ and it says something only when it is worth it:
   3); nothing in a dry run (the log says what it would set).
 
 Otherwise it says nothing. It reads every channel it can see, but posts only in forum threads, those replies in the
-general channels, and the staff channel. It
+general channels, the staff channel and the FAQ it was asked to post. It
 stays out of a thread once staff wrote in it (the server owner, `BOT_STAFF`, anyone who can manage threads), and replies
 at most twice in a thread on its own. Someone answering it gets a look past that, up to `BOT_MAX_TALK` replies (4):
 after it asked for something, the poster's next post, which always gets a reply (a fix, or what their log shows and
@@ -102,9 +115,10 @@ report or update in the staff channel, and no more looks in that thread unless s
 still goes out; new logs still reach the report).
 
 Every model call goes on a meter (`spend.mjs`, `state/spend.json`): looks, sorting, tags, translations, release checks,
-against `BOT_BUDGET` dollars a month (200, UTC months). Only the looks wait for money: each day they may spend what is
+against `BOT_BUDGET` dollars a month (400, UTC months). Only the looks wait for money: each day they may spend what is
 left of the month over the days left in it, so a quiet day leaves more for the rest and a busy week can't spend the
-month. A look past today's share waits for the next day and runs then; staff's mentions still get theirs at once. The
+month. A look past today's share waits for the next day and runs then; staff's mentions and a release's notices
+(fix live, suggestion added) still get theirs at once. The
 bot's first log line says what the month and the day spent so far.
 
 ## How it works
@@ -114,13 +128,18 @@ bot's first log line says what the month and the day spent so far.
   visual tokens big (`picture()` in `investigate.mjs`, with sharp), the size Claude read pictures at before Opus 4.7:
   a phone screenshot costs 1,456 tokens instead of 3,354, a 4K one 1,560 instead of 4,784.
 - `investigate.mjs`: one look. It sends Claude the rules (`system.md`), the maintainer's notes (`knowledge.md`),
-  `docs/web/PLAYING.md`, the live version, recent commits, recent threads and the problems the developer has a report
-  on (each report's first thread, where it stands; what it points posters to and joins duplicates to), and the
-  thread with the files it can read named at its top. The rules, the notes, the guide and the code's history (the
-  same for every look until the next commit or release) are kept an hour in the prompt cache, so a look reads them
-  for a tenth of the price instead of sending them again. Claude reads what it needs through the
-  tools, then returns a verdict as JSON: none, ask or answer, and whether to tell the developer. `vet()` drops weak
-  answers and replies that paste code.
+  `docs/web/PLAYING.md` as of the live version, the live version, recent commits, recent threads and the problems the
+  developer has a report on (each report's first thread, where it stands, where its logs crash or freeze; what it
+  points posters to and joins duplicates to), and the thread with the files it can read named at its top. `sigs.mjs`
+  reads the top three functions of each log's crash (`TRAP`) or freeze (watchdog) stack; the look is told the reports
+  whose logs stop in the same place (two functions in common), so threads join by the bug, not by the exit code.
+  The rules, the notes, the guide and the code's history up to the live version (the same for every look until the
+  next release, or a change to the rules or the notes) are kept an hour in the prompt cache, so a look reads them for
+  a tenth of the price instead of sending them again; the newest commits, which change more often, go with the
+  thread. Claude reads what it needs through the tools, several calls a turn, at most 8 turns, then returns a verdict
+  as JSON: none, ask or answer, and whether to tell the developer. `vet()` drops weak answers and replies that paste code. A new post in a suggestion forum first
+  gets a quick pass with Haiku and no tools (`firstPass()`): when it finds nothing for the bot to say, its summary,
+  category and tags stand and there is no full look; anything else gets the full look, which writes the reply.
 - `tools.mjs`: what Claude can do. It can search and read the code, read the thread's attachments, look at the git
   history (`LIVE` is the live server's commit), search the forums' threads (to point a duplicate to the earlier one)
   and the archive of recent messages (the staff channel's marked private: the model may use them, never repeat them).
@@ -133,12 +152,15 @@ bot's first log line says what the month and the day spent so far.
   (a release of only the page or the server keeps the module's `nfsu2.json`). Each new live version goes into
   `state/releases.json` with its time (the file's, which `release.sh` writes as the release goes out), and every
   commit the model reads shows when it went live.
-- `archive.mjs`: every message of every channel the bot sees, kept 7 days in `state/archive/`. At start the bot reads
-  the forums' threads with posts in the last 48 hours, nothing older: it lists them (titles and first posts) in
-  `state/threads.json`, and looks at the ones opened in that time that it never looked at, so a restart misses no post.
+- `archive.mjs`: every message of every channel the bot sees, kept 30 days in `state/archive/` (the model searches the
+  last 7), with their text files (gzipped) and pictures (WebP, at the size the API shrinks them to) in
+  `state/archive/files/`, at most 3 GB: past that the oldest days' files go first. Videos and zips: names only. At start the bot reads the forums' threads with posts in the last 48 hours, nothing older: it lists them
+  (titles and first posts) in `state/threads.json`, and looks at the ones opened in that time that it never looked
+  at, so a restart misses no post.
 - `general.mjs`: the general channels: the replies that point to the forums or give a page code's fix, the spike
   alerts and the daily note.
 - `translate.mjs`: the Translate command. The bot registers it at start; the `bot` scope of the invite covers it.
+- `faq.mjs`: the FAQ message, its answers and their translations; `faq.md` holds the questions and answers.
 - `tags.mjs`: the forum tags. A look's verdict names the tags it picked from "Tags you may add" in the thread's text.
 - `eval.mjs`: the bot against past threads (below).
 
@@ -169,8 +191,10 @@ the tools used, the tokens and the cost.
    aware, Fix live, Complete and Solved (any letter case). Tags players should not set themselves (Needs info, Dev
    aware, Fix live, Complete, Denied): "Only allow moderators to apply this tag" in the forum's tag settings. The bot
    never picks a moderated tag, its own five aside.
-4. **Claude.** Create an API key at https://console.anthropic.com, and set a monthly spend limit there.
-5. **`.env`**:
+4. **FAQ channel.** In the read-only channel's permissions, add the bot with View Channel and Send Messages, then
+   type `/faq` there.
+5. **Claude.** Create an API key at https://console.anthropic.com, and set a monthly spend limit there.
+6. **`.env`**:
 
    ```sh
    DISCORD_TOKEN=...
@@ -256,7 +280,7 @@ Run it with `BOT_DRY_RUN=1` for a day. Every reply it would have posted goes to 
 | `BOT_WAIT_S` | `120` | quiet time after the poster's last message before the look (at most 10 minutes after the first) |
 | `BOT_MAX_REPLIES` | `2` | replies per thread on the bot's own (logs, bumps and staff's mentions get a look past it) |
 | `BOT_MAX_TALK` | `4` | replies per thread in all, answering people who reply to the bot or mention it |
-| `BOT_BUDGET` | `200` | dollars a month for every model call; looks past the day's share wait for the next day |
+| `BOT_BUDGET` | `400` | dollars a month for every model call; looks past the day's share wait for the next day |
 | `BOT_ARCHIVE` | on | `0`: don't keep messages (the model then can't search other channels) |
 | `BOT_STATE` | `state` (`/state` in Docker) | where the clone, the archive, the thread list, the verdicts and the translations go |
 | `BOT_REPO`, `BOT_BRANCH` | this checkout, `main` | where the code comes from (in `compose.yml`: GitHub over SSH) |

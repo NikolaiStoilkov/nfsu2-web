@@ -4,9 +4,10 @@
 // shapes.  See web/src/host/abi.ts for the shared-memory side (nfsu2_register
 // kinds).
 import type { GameProcess } from '../host/process';
+import type { PhotoLook } from '../gpu/photo-picture';
 import type { PadPage, TouchPad } from '../input/gamepad';
 import type { TextEntry } from '../input/index';
-import type { NetQueue, NetRemoved } from '../net';
+import type { NetQueue, NetRaces, NetRemoved, NetRename } from '../net';
 
 /** Given to every subsystem. */
 export interface CommonOptions {
@@ -26,8 +27,8 @@ export interface RendererOptions extends CommonOptions {
   /** tests: scale of those dumps */
   dumpScale?: number;
   /** the GPU device was lost while the game ran (a graphics driver reset, the browser's graphics process
-   *  crashed): nothing is drawn from then on */
-  onLost?(): void;
+   *  crashed): nothing is drawn from then on.  why: the browser's reason and message (the log's "[gpu] device lost" line) */
+  onLost?(why: string): void;
   /** every frame drawn, in the same task: quick chat's places over the cars in it, n of { id, x, y, scale } (ids in
    *  ids[4i], the rest in m[4i + 1..3]; x, y parts of the game's image; the arrays are reused: read them at once) */
   onMarks?(n: number, m: Float32Array, ids: Uint32Array): void;
@@ -62,6 +63,12 @@ export interface NetOptions extends CommonOptions {
   lobby?: (json: string) => void;
   /** free roam: quick chat, a phrase said (by a friend or the player), as JSON from the game */
   say?: (json: string) => void;
+  /** free roam: the player's car and another's touched front bumpers for 3 s, or parted, as JSON from the game */
+  bump?: (json: string) => void;
+  /** free roam: a drift battle's scoreboard, as JSON from the game ("{}": none; drift.ts) */
+  battle?: (json: string) => void;
+  /** free roam: a friend message from the server */
+  friend?: (m: Record<string, unknown>) => void;
   /** the server's LAN took this page back after the link was lost (a server restart, as for a deploy) */
   back?: () => void;
   /** the server is full: this page's place in line for one (null: not in line) */
@@ -76,6 +83,11 @@ export interface NetOptions extends CommonOptions {
   block?: string[];
   /** the operator removed this player from playing with others (a kick or a ban) */
   removed?: (r: NetRemoved) => void;
+  /** the operator's race ban: this player plays on with others but races none of them, until when and why (null: it
+   *  races again) */
+  races?: (r: NetRaces | null) => void;
+  /** the operator took this player's name away: the page asks for another (NetSubsystem.rename) */
+  rename?: (r: NetRename) => void;
 }
 
 /** What an attach call returns.  Everything but detach is optional. */
@@ -90,8 +102,16 @@ export interface Subsystem {
 export interface RendererSubsystem extends Subsystem {
   /** the game's image inside the canvas, in canvas pixels */
   imageRect(): { x: number; y: number; w: number; h: number };
-  /** tests: the next frame as PNG (also uploaded as <name>.png with RendererOptions.artifacts) */
-  dump?(name: string): Promise<Blob>;
+  /** tests, F12: the next frame as PNG (also uploaded as <name>.png with RendererOptions.artifacts); mark: the
+   *  site's address in its corner */
+  dump?(name: string, mark?: boolean): Promise<Blob>;
+  /** photo mode's picture as PNG (gpu/photo-picture.ts: once the still picture has all its frames, with its look and
+   *  crop); dump()'s with photo mode off */
+  photo?(name: string, mark?: boolean): Promise<Blob>;
+  /** photo mode's look and crop, shown from the next frame on and kept by photo() */
+  photoLook?(look: PhotoLook): void;
+  /** photo mode's still picture so far: frames in it, frames it will have (0: none coming) */
+  photoProgress?(): { n: number; target: number };
   /** each frame's time from its submit until the GPU had done it, ms, since the last call (rendercheck.ts) */
   doneMs?(): number[];
   /** the game's textures on the GPU now, bytes, those unpacked from DXT and those DXT1 as ASTC (the log's copy,
@@ -117,6 +137,9 @@ export interface InputSubsystem extends Subsystem {
   sms?(id: number): boolean;
   /** photo mode (runtime/photo.c, photo.ts): what (its PH_* number) and its values; false: it cannot reach the game */
   photo?(what: number, a?: number, b?: number): boolean;
+  /** a new name for free roam and Online mode, now (the operator took the old one away); false: it cannot reach the
+   *  game */
+  name?(name: string): boolean;
   /** every key and button the game holds goes up (photo mode takes the keys) */
   releaseAll?(): void;
   /** performance.now() of the player's last key, mouse or controller input; null: the page cannot tell
@@ -128,8 +151,9 @@ export interface InputSubsystem extends Subsystem {
   touchPad?(t: TouchPad | null): void;
   /** the touch controls' level horizon: the phone's tilt the game's 3D view turns against, radians, + = clockwise */
   viewRoll?(rad: number): void;
-  /** the menus' help bar buttons' size, 1 = the game's own (touch.ts: the Menu button size) */
-  menuScale?(s: number): void;
+  /** the menus' small buttons' size, 1 = the game's own (touch.ts: the Menu button size): the scroller arrows', and
+   *  with bar the help bar's too (else it keeps the game's own) */
+  menuScale?(s: number, bar: boolean): void;
   /** performance.now() of a real controller's last button press (0: none) */
   padPressed?(): number;
   /** the game's text entry while it is up (a new profile's name, the LAN name), else null */
@@ -150,17 +174,20 @@ export interface NetSubsystem extends Subsystem {
   away?(on: boolean): void;
   /** the player stops waiting in line for a place (a full server): off the server's LAN for the rest of this game */
   offline?(): void;
-  /** free roam's solid cars, switched while the game runs (the page menu) */
-  solid?(on: boolean): void;
-  /** quick chat: the player says phrase p (quickchat.ts); false: the game has no free roam */
-  say?(p: number): boolean;
+  /** the player picked another name after the operator took its name away: back on the server's LAN under it */
+  rename?(name: string): void;
+  /** free roam's solid cars, switched while the game runs (the page menu), as roam_collide has them */
+  solid?(collide: 'on' | 'off' | 'none'): void;
+  /** quick chat: the player says phrase p (quickchat.ts; race: in a race between players); false: the game has no free
+   *  roam (race: no LAN play) */
+  say?(p: number, race?: boolean): boolean;
+  /** free roam's friends: a message to the server (friends.ts); false: not connected now */
+  friend?(m: Record<string, unknown>): boolean;
   /** free roam's crews, changed while the game runs (the page menu): their hashes, in the player's order, and their
    *  colours (0x00rrggbb) */
   crews?(hashes: readonly number[], rgbs: readonly number[]): void;
   /** free roam's room, changed while the game runs (an invite link): true when this game takes it now */
   room?(name: string): boolean;
-  /** whether this game takes a room changed while it runs (a module of before does not) */
-  canRoom?(): boolean;
 }
 
 export type AttachRenderer = (proc: GameProcess, canvas: HTMLCanvasElement, opts: RendererOptions) => RendererSubsystem | Promise<RendererSubsystem>;

@@ -128,6 +128,10 @@ export class Encoder {
   /** the game's textures on the GPU, bytes: all of them, those unpacked from DXT and those DXT1 as ASTC (no
    *  texture-compression-bc) */
   texBytes = 0; unpackBytes = 0; astcBytes = 0;
+  /** textures made and freed since the log's last minute line (index.ts zeroes them): friends' cars coming and
+   *  going, the world after a shop */
+  texMade = 0; texMadeBytes = 0; texFreed = 0; texFreedBytes = 0;
+  get bindGroups(): number { return this.bg1.size; }
   /** blocks with a transparent texel that went into a texture already ASTC: two planes (astc.ts) */
   private astcHoles = { blocks: 0 };
   /** WebGPU calls made by encodeFrame, by kind (totals; what the GPU process decodes and records) */
@@ -141,7 +145,7 @@ export class Encoder {
       unaligned: f.has('texture-compression-unaligned' as GPUFeatureName) };
     this.views();
     const d = device;
-    // the shader ABI's explicit layouts (docs/web/gpu-abi.md section 2), shared with the shader check
+    // the shader ABI's explicit layouts, shared with the shader check
     const abi = createShaderAbi(d);
     this.bgl0 = abi.group0; this.bgl1 = abi.group1; this.bgl1c = abi.group1Cube;
     this.pl2d = abi.layout2d; this.plCube = abi.layoutCube;
@@ -279,6 +283,7 @@ export class Encoder {
     }
     bytes *= cube ? 6 : 1;
     this.texBytes += bytes; if (gf.unpack) this.unpackBytes += bytes; if (gf.astc) this.astcBytes += bytes;
+    this.texMade++; this.texMadeBytes += bytes;
     this.tex[id] = { serial: this.serial++, tex, fmt, w, h, levels, cube, rt, view: tex.createView(vd), rtViews, expandA8: gf.a8, bc: gf.bc,
       unpack: !!gf.unpack, astc: !!gf.astc, filled: false, bytes };
   }
@@ -288,6 +293,7 @@ export class Encoder {
     if (!t) return;
     t.tex.destroy();
     this.texBytes -= t.bytes; if (t.unpack) this.unpackBytes -= t.bytes; if (t.astc) this.astcBytes -= t.bytes;
+    this.texFreed++; this.texFreedBytes += t.bytes;
     this.tex[id] = undefined;
     if (this.bg1.size > 8192) this.bg1.clear();       // keys carry serials: stale entries are never hit again
   }
@@ -768,7 +774,7 @@ export class Encoder {
 
       // group 0: vertex source + VS constants + PS parameters.  K is a 64 KB window of the
       // frame's constant arena that many draws share: the draw's block is row kb of it, given
-      // as firstInstance (gpu-abi.md section 3).  A new bind group only for another vertex
+      // as firstInstance.  A new bind group only for another vertex
       // source, other PS parameters or a block past the window.
       const isz = u32[w + D.ixIsz];
       const src = isz ? Src.Pool : vsid > 0 ? Src.Raw : Src.TVert;

@@ -8,12 +8,15 @@
 //   node web/tools/run-suite.mjs [options] [scenario ...]
 //     --base URL        the local server, started with --dev (default http://localhost:8611)
 //     --run NAME        output directory out/web/runs/NAME (default suite-<date>-<time>)
-//     --jobs N          scenarios at once, each in its own browser context (default 1)
+//     --jobs N          scenarios at once, each in its own browser context (default: a third of the cores, 1 to 4;
+//                       the longest first, by the last run's times)
 //     --env K=V         extra environment for every scenario (repeatable)
 //     --timeout-scale X multiply every scenario's time limit (default 1)
 //     --script FILE     an ad-hoc scenario: tests/scripts/FILE (with --marker, --name, --net NAME;
 //                       NFSU2_SAVE_SEED seeds its save directory)
 //     --save-out DIR    each scenario's save directory afterwards, as DIR/<scenario>/ (a seed for the next run)
+//     --allow WHY,...   with --script: what the scenario expects of web/tools/judge.mjs's failures (freeze for
+//                       watchdog_loading.txt)
 //     --list            print the scenario table and exit
 //   no scenario names: every runnable scenario of the table.
 //   NFSU2_SAVE_SEED=<dir> (as run_suite.sh): a save tree copied into the
@@ -22,12 +25,15 @@
 //   before its sponsor, work/seed/career/s2_start).
 //
 // Pass (as run_suite.sh): exit code 0, "quit at guest frame", the scenario's
-// marker, no fault marker (FAULT IN GUEST, GUEST MEMORY FAULT, HOST SEGV), no
-// "TIME LIMIT REACHED" (the runner's timeout writes it), no "[trap]" line, no
-// "UNRESOLVED INDIRECT", no "[expect] FAIL", tests/checks/<name>.sh passes.
-// The browser adds: no trap in a worker ("TRAP in thread"), no page error,
-// no unimplemented host import, no stack overflow (RangeError).  As
-// run_suite.sh: no "[net] BLOCKED" / "[roam] BLOCKED" line.  Scenarios marked
+// marker, tests/checks/<name>.sh passes, and none of web/tools/judge.mjs's
+// failures: a fault marker (FAULT IN GUEST, GUEST MEMORY FAULT, HOST SEGV),
+// "TIME LIMIT REACHED" (the runner's timeout writes it), a "[trap]" line,
+// "UNRESOLVED INDIRECT", "[expect] FAIL", a trap in a worker ("TRAP in
+// thread"), a page error, an unimplemented host import, a stack overflow
+// (RangeError), a "[net] BLOCKED" / "[roam] BLOCKED" line, a script wait that
+// ran out (its TIMEOUT line: the script goes on, and a marker after it still
+// comes), a script line the runtime could not read, a freeze the stall
+// watchdog reported.  Scenarios marked
 // net attach the page's virtual LAN (&net=<name>, web/src/net): lan_host hosts
 // a LAN game with the lifted server.dll on the server's switch (the Mac runs it
 // on loopback).
@@ -38,14 +44,22 @@
 import { chromium } from 'playwright';
 import { pickBrowser } from './browser.mjs';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { requireDev, moduleLine } from './dev-server.mjs';
 import { seedSave } from './save-seed.mjs';
+import { logWhy } from './judge.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
+// what a scenario is known to show of web/tools/judge.mjs's failures: noted beside its PASS, not failing it
+const ALLOW = {
+  // the car lot's save dialog stays open after "save: Yes", so the script's waitfng HUD_SingleRace.fng runs out (every
+  // run since 10-18); the career bot then leaves the shop by itself
+  careerbot: ['wait-timeout'],
+};
 // name, script, marker, extra env, time limit (s; run_suite.sh's ALARM), not runnable yet: why
 const TABLE = [
   ['quickrace', 'quickrace.txt', 'waitmem [0x008654a4]==6 satisfied', '', 400],
@@ -85,7 +99,7 @@ const TABLE = [
   // every 16th block's compressed address never answers (its byte range does), and the cache on this PC fills up
   // at the 40th block (a read failed with it, and the game crashed)
   ['datafault', 'quickrace.txt', 'waitmem [0x008654a4]==6 satisfied', 'NFSU2_DATA_FAULT=fail:7,hang:29,stall:3000,deny:16,full:40', 400],
-].map(([name, script, marker, extra, alarm, blocked, net]) => ({ name, script, marker, extra, alarm, blocked, net }));
+].map(([name, script, marker, extra, alarm, blocked, net]) => ({ name, script, marker, extra, alarm, blocked, net, allow: ALLOW[name] }));
 // opt-in (named only): needs a career save from stage 2 on (NFSU2_SAVE_SEED on the Mac)
 const SEED = process.env.NFSU2_SAVE_SEED ?? '';
 const OPT = [{ name: 'outrun', script: 'career_outrun.txt', marker: 'player completion 6 (6 won', extra: 'NFSU2_CAREER_RACEWIN=3', alarm: 400,
@@ -93,7 +107,7 @@ const OPT = [{ name: 'outrun', script: 'career_outrun.txt', marker: 'player comp
 { name: 'sponsor', script: 'career_sponsor.txt', marker: 'waitfng UI_postrace.fng satisfied', extra: 'NFSU2_CAREER_RACEWIN=3', alarm: 400,
   seed: true, blocked: SEED ? undefined : 'needs a career save in stage 2 before its sponsor: NFSU2_SAVE_SEED=<save tree>' }];
 
-// the environment of tests/run_suite.sh + tools/autorun.sh (DESIGN.md section 5)
+// the environment of tests/run_suite.sh + tools/autorun.sh
 const SUITE_ENV = {
   NFSU2_SAVEDIR: '/save', NFSU2_READONLY_DATA: '1', NFSU2_DISCORD: '0', NOFOCUS: '2', NFSU2_FNG_LOG: '1',
   NFSU2_STATUS_EVERY: '600', NOMOVIES: '1', SNDSYNC: '0', GPUVS: '1', FIXMAT: '0', FIXMAT_MODE: '3',
@@ -101,7 +115,9 @@ const SUITE_ENV = {
 
 // ---- arguments ----
 const argv = process.argv.slice(2);
-const opt = { base: 'http://localhost:8611', run: '', jobs: 1, env: [], scale: 1, script: '', marker: '', name: '', net: '', saveOut: '', list: false };
+// a game in headless Chrome keeps about three cores busy
+const JOBS = Math.max(1, Math.min(4, Math.floor(os.cpus().length / 3)));
+const opt = { base: 'http://localhost:8611', run: '', jobs: JOBS, env: [], scale: 1, script: '', marker: '', name: '', net: '', saveOut: '', allow: [], list: false };
 const names = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i], v = () => argv[++i];
@@ -109,6 +125,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--env') opt.env.push(v()); else if (a === '--timeout-scale') opt.scale = +v();
   else if (a === '--script') opt.script = v(); else if (a === '--marker') opt.marker = v(); else if (a === '--name') opt.name = v();
   else if (a === '--net') opt.net = v(); else if (a === '--save-out') opt.saveOut = v();
+  else if (a === '--allow') opt.allow.push(...v().split(','));
   else if (a === '--list') opt.list = true; else names.push(a);
 }
 if (opt.list) {
@@ -121,7 +138,7 @@ const MODULE = await moduleLine(opt.base);
 if (MODULE) console.log(MODULE);
 let scen;
 if (opt.script) scen = [{ name: opt.name || path.basename(opt.script, '.txt'), script: opt.script, marker: opt.marker, extra: '', alarm: 400, net: opt.net,
-  seed: !!SEED }];   // NFSU2_SAVE_SEED seeds an ad-hoc scenario too
+  seed: !!SEED, allow: opt.allow }];   // NFSU2_SAVE_SEED seeds an ad-hoc scenario too
 else if (names.length) {
   scen = names.map(n => [...TABLE, ...OPT].find(s => s.name === n) ?? (console.error(`unknown scenario ${n} (--list)`), process.exit(2)));
 } else scen = TABLE;
@@ -147,20 +164,11 @@ function urlFor(s) {
 
 function judge(s, log, exit) {
   const why = [];
-  const has = re => re.test(log);
   if (exit === null) why.push('no-exit'); else if (exit !== 0) why.push(`exit=${exit}`);
   if (!log.includes('quit at guest frame')) why.push('no-quit');
-  if (has(/FAULT IN GUEST|GUEST MEMORY FAULT|HOST SEGV/)) why.push('fault');
-  if (log.includes('TIME LIMIT REACHED')) why.push('timeout');
-  if (has(/^\[trap\]/m)) why.push('trap');
-  if (log.includes('UNRESOLVED INDIRECT')) why.push('unresolved-icall');
-  if (has(/^\[expect\] FAIL/m)) why.push('expect-failed');
   if (s.marker && !log.includes(s.marker)) why.push(`missing:'${s.marker}'`);
-  if (has(/^TRAP in thread/m)) why.push('wasm-trap');
-  if (has(/^PAGEERROR|^WORKERERROR|^CRASH/m)) why.push('page-error');
-  if (has(/unimplemented import/)) why.push('unimplemented-import');
-  if (has(/RangeError|Maximum call stack/)) why.push('stack-overflow');
-  if (has(/^\[(net|roam)\] BLOCKED/m)) why.push('net-blocked');
+  why.push(...logWhy(log, { allow: s.allow }));
+  why.noted = logWhy(log).filter(w => s.allow?.includes(w));
   const chk = path.join(ROOT, 'tests/checks', `${s.name}.sh`);
   if (fs.existsSync(chk)) {
     let out = '', ok = true;
@@ -234,11 +242,20 @@ async function runOne(browser, s) {
   const why = judge(s, log, timedOut ? null : exit);
   const st = (log.match(/^\[status\] .*$/gm) ?? []).pop()?.replace(/^\[status\] /, '') ?? '';
   const frame = /quit at guest frame (\d+)/.exec(log)?.[1] ?? '-';
-  return { name: s.name, pass: why.length === 0, why, wall, frame, status: st, log: path.relative(ROOT, logPath) };
+  return { name: s.name, pass: why.length === 0, why, noted: why.noted, wall, frame, status: st, log: path.relative(ROOT, logPath) };
 }
 
 const results = [], skipped = [];
 const queue = scen.filter(s => { if (s.blocked) { skipped.push(s); return false; } return true; });
+// the longest first, so that the jobs end together instead of a long one starting last: each scenario's wall time in
+// the latest run that had it (out/web/runs/*/summary.json), else its time limit
+const lastWall = {};
+const runsDir = path.join(ROOT, 'out/web/runs');
+for (const d of (fs.existsSync(runsDir) ? fs.readdirSync(runsDir) : []).map(d => path.join(runsDir, d, 'summary.json'))
+  .filter(f => fs.existsSync(f)).sort((a, b) => fs.statSync(a).mtimeMs - fs.statSync(b).mtimeMs)) {
+  try { for (const r of JSON.parse(fs.readFileSync(d, 'utf8')).results ?? []) if (r.wall) lastWall[r.name] = r.wall; } catch {}
+}
+queue.sort((a, b) => (lastWall[b.name] ?? b.alarm) - (lastWall[a.name] ?? a.alarm));
 // (nothing to run, every scenario named not runnable yet: no browser, only the summaries)
 const browser = queue.length ? await chromium.launch({ ...pickBrowser(), headless: true,
   args: ['--enable-unsafe-webgpu', ...(process.env.CHROME_ARGS ? process.env.CHROME_ARGS.split(' ') : [])] }) : null;
@@ -247,7 +264,8 @@ async function worker() {
   for (let s; (s = queue.shift());) {
     const r = await runOne(browser, s);
     results.push(r);
-    console.log(`${r.pass ? 'PASS' : 'FAIL'} ${r.name.padEnd(11)} ${r.wall.toFixed(0).padStart(4)} s  frame ${r.frame}${r.pass ? '' : '  ' + r.why.join(' ')}`);
+    console.log(`${r.pass ? 'PASS' : 'FAIL'} ${r.name.padEnd(11)} ${r.wall.toFixed(0).padStart(4)} s  frame ${r.frame}${r.pass ? '' : '  ' + r.why.join(' ')}` +
+      (r.noted.length ? `  (known: ${r.noted.join(' ')})` : ''));
   }
 }
 await Promise.all(Array.from({ length: Math.max(1, opt.jobs) }, worker));

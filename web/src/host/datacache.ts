@@ -7,19 +7,26 @@
 
 export const BLOCK = 1 << 20;
 export const CACHE_DIR = 'cache';
+/** the game data's cache files the I/O worker keeps open in this browser (io-worker.ts CACHE_OPEN, which says why):
+ *  512 in Chrome (Edge, Opera...) and Firefox on Windows, 64 elsewhere (Safari takes 251 handles at most) */
+export function cacheOpen(ua: string): number {
+  return /Windows/.test(ua) && /\b(Chrome|Firefox)\//.test(ua) ? 512 : 64;
+}
 /** where the server has the manifest and the install folder (web/server-rs/src/app/manifest.rs) */
 export const MANIFEST_URL = '/data-manifest', DATA_BASE = '/data/';
 
 /** the server's /data-manifest: every file and folder of the install folder it serves, and where it serves runs
- *  of their blocks compressed (an older server has no "blocks": byte ranges of /data/ then) */
+ *  of their blocks compressed */
 export interface Manifest {
   files: { p: string; d?: number; s?: number; m?: number }[];
-  blocks?: { url: string; size: number; max: number };
+  blocks: { url: string; size: number; max: number };
 }
-/** The manifest's compressed runs, if it has them in this cache's block size: [url, most blocks a request]. */
-export function blockRuns(m: Manifest): { url: string; max: number } | null {
+/** The manifest's compressed runs in this cache's block size: [url, most blocks a request]; throws when it names
+ *  none. */
+export function blockRuns(m: Manifest): { url: string; max: number } {
   const b = m.blocks;
-  return b && typeof b.url === 'string' && b.url.startsWith('/') && b.size === BLOCK && b.max >= 1 ? { url: b.url, max: b.max } : null;
+  if (b && typeof b.url === 'string' && b.url.startsWith('/') && b.size === BLOCK && b.max >= 1) return { url: b.url, max: b.max };
+  throw new Error(`the list of game files names no blocks of ${BLOCK} bytes (${JSON.stringify(b ?? null)})`);
 }
 /** blocks first .. first+n-1 of a file, compressed: a 200 whose body (decoded by the browser) is exactly their bytes.  The
  *  file's mtime and size (m, s) make a changed file a new address, so the server lets Cloudflare keep the answer for
@@ -31,15 +38,32 @@ export interface CacheFile { h: FileSystemSyncAccessHandle; have: Uint8Array; ha
 
 export const manifestFiles = (m: Manifest): DataFile[] => m.files.filter(f => !f.d).map(f => ({ path: f.p, size: f.s ?? 0, mtime: f.m ?? 0 }));
 const parts = (f: DataFile) => f.path.toLowerCase().split('/');
+/** The data the settings pick: a texture pack (TEXPACKS/<name>.pak, runtime/web/texrep_web.c; '' for none) and the
+ *  songs (settings.ini songs: 'original' reads pfdata/original's files in place of pfdata's, songsPath). */
+export interface Packs { texpack: string; songs: string }
+export const NO_PACKS: Packs = { texpack: '', songs: '' };
+/** EA's own songs (tools/musicpack.py --original) for a file of pfdata: pfdata/<name> -> pfdata/original/<name>; null
+ *  for any other path.  The folder's own are a soundtrack mod's uncensored versions. */
+export function songsPath(path: string): string | null {
+  const p = path.split('/');
+  return p.length === 2 && p[0].toLowerCase() === 'pfdata' ? [p[0], 'original', p[1]].join('/') : null;
+}
 /** The files a game in this language reads: the folder's, but where its language pack (LANGPACKS/<language>,
  *  runtime/language.c) has a file of the same path, that one; no other language's pack; of the texture packs
- *  (TEXPACKS/<name>.pak, runtime/web/texrep_web.c) only the one picked (texpack, '' for none). */
-function gameFiles(files: DataFile[], language: string, texpack: string): DataFile[] {
+ *  (TEXPACKS/<name>.pak and its <name>.tracks, runtime/web/texrep_web.c) only those picked (packs.texpack: their
+ *  names, comma-separated; '' for none); pfdata/original's files only with the original songs, and then in place
+ *  of pfdata's. */
+function gameFiles(files: DataFile[], language: string, packs: Packs): DataFile[] {
   const own = new Set(files.filter(f => { const p = parts(f); return p[0] === 'langpacks' && p[1] === language; })
     .map(f => parts(f).slice(2).join('/')));
+  const isOriginal = (p: string[]) => p.length === 3 && p[0] === 'pfdata' && p[1] === 'original';
+  const original = packs.songs === 'original';
+  const replaced = new Set(original ? files.map(parts).filter(isOriginal).map(p => `pfdata/${p[2]}`) : []);
   return files.filter(f => {
     const p = parts(f);
-    if (p[0] === 'texpacks') return p.length === 2 && p[1] === `${texpack}.pak`;
+    if (p[0] === 'texpacks') return p.length === 2 && packs.texpack.split(',').some(n => n && (p[1] === `${n}.pak` || p[1] === `${n}.tracks`));
+    if (isOriginal(p)) return original;
+    if (replaced.has(p.join('/'))) return false;
     return p[0] === 'langpacks' ? p[1] === language : !own.has(p.join('/'));
   });
 }
@@ -54,12 +78,12 @@ export function av1Path(path: string): string | null {
 /** What "Preload the game data" fetches: all but the movies (MOVIES/, a third of the folder in VP6 video that
  *  does not compress, and their AV1 copies).  They stream as they play, and with Movies off the game never opens
  *  them. */
-export const aheadFiles = (files: DataFile[], language: string, texpack = '') =>
-  gameFiles(files, language, texpack).filter(f => !isMovie(f));
+export const aheadFiles = (files: DataFile[], language: string, packs: Packs = NO_PACKS) =>
+  gameFiles(files, language, packs).filter(f => !isMovie(f));
 /** The movies a game in this language can open: its VP6 files, or where it plays AV1 (av1) their AV1 copies, the
  *  VP6 file where a movie has none (as the I/O worker opens them, io-worker.ts dataFile). */
 export function languageMovies(files: DataFile[], language: string, av1 = false): DataFile[] {
-  const all = gameFiles(files, language, '').filter(isMovie), byPath = new Map(all.map(f => [f.path.toLowerCase(), f]));
+  const all = gameFiles(files, language, NO_PACKS).filter(isMovie), byPath = new Map(all.map(f => [f.path.toLowerCase(), f]));
   return all.filter(f => av1Path(f.path) !== null).map(f => (av1 && byPath.get(av1Path(f.path)!.toLowerCase())) || f);
 }
 export const dataUrl = (base: string, path: string) => base + path.split('/').map(encodeURIComponent).join('/');

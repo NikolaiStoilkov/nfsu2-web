@@ -434,9 +434,48 @@ static int force_rain(void){
     if (fr < 0){ const char *e = getenv("FORCERAIN"); fr = e ? atoi(e) : 0; }
     return fr;
 }
+/* --- One weather for everyone in free roam --------------------------------
+ * sub_0061e380(x, y) is the rain at a place: the "Rain" zone's rain there
+ * (its param 0) when v = |0.5 cos(t + x/50) + 0.5| <= the zone's threshold
+ * (param 1), else 0 (sub_006134e0: t the world timer 0x7fb718 in s, the
+ * angle in degrees), so the rain comes and goes in a 6-minute cycle, shifted
+ * by 1 s for every 50 m along x (measured at the prologue's spot: rain 0.75
+ * below v ~0.05, about 52 s of every 6 minutes, from 2:00 after a load on
+ * the game's clock).  Rain::Update takes it at the camera (the drops, the
+ * fog, the sound), and the car physics at each car (sub_005a4d80 and
+ * sub_005aad90 through 0x5ed5d0): a grip x (1 - 0.025 x rain), as the game's
+ * weather tip says.  The world timer starts at 1 s with each World
+ * (0x5ff490 -> 0x576cf0), so in free roam each player had their own weather,
+ * and their own grip at the same place.  Network races need nothing: every
+ * client's world timer follows the race host's (0x601a60).
+ * In free roam's world with free-roam multiplayer on, t is the device's UTC
+ * time mod 360 s instead, the same for everyone whose clock is right (a
+ * clock some seconds off only moves the rain's start and end as much).  The
+ * formula and the zones stay the game's, so it rains as often and as long
+ * as before; only where in the cycle a world starts changes (the game's own
+ * clock started each load at the same point).  Solo, races, the Dyno Shop
+ * and LAN keep the game's clock. */
+int roam_game_shared_weather(void);       /* roam_game.c: free roam's world with free-roam multiplayer on */
+#define A_WORLD_T   0x007fb718u           /* WorldTimer in seconds (float) */
+#define A_TICKS     0x0086518cu           /* WorldTimer in ticks: a new value each world step */
+static float shared_weather_t(void){
+    static uint32_t at = ~0u; static float t;
+    uint32_t tick = MR32(A_TICKS);
+    if (tick != at){                      /* the clock once a step: the car physics asks once per car */
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        t = (float)((double)(ts.tv_sec % 360) + (double)ts.tv_nsec * 1e-9);
+        at = tick;
+    }
+    return t;
+}
 void sub_0061e380_orig(CPU *c);
 void sub_0061e380(CPU *c){
-    sub_0061e380_orig(c);
+    if (roam_game_shared_weather()){
+        float own = MRF32(A_WORLD_T);
+        MRF32(A_WORLD_T) = shared_weather_t();
+        sub_0061e380_orig(c);
+        MRF32(A_WORLD_T) = own;
+    } else sub_0061e380_orig(c);
     int fr = force_rain();
     if (fr == 1 || fr == 4) ST(0) = 1.0; else if (fr == 2 || fr == 3) ST(0) = 0.0;
 }
@@ -496,9 +535,36 @@ void sub_0060faa0(CPU *c){
  * game's.  The game's view space has y down (the projection's P11 is
  * negative), so this turns the picture anticlockwise for a + roll.  Photo
  * mode's tilt turns it the same way, and its field of view (camera +0xC4, a
- * binary angle) stands in for the camera's for the call (photo.c). */
+ * binary angle) stands in for the camera's for the call (photo.c).  So does
+ * its frame's shift for a still picture: the eye moved along the view's x
+ * and y (the camera's matrix, its translation row, for the call), then the
+ * projection sheared after (its third row: x and y go by that much times the
+ * depth) so that the picture moves within a pixel and what is at the focus
+ * distance F stays where it was (the eye's move a goes back by a * P00 / F),
+ * and the product made again (the view times the projection).  photo.c
+ * gives the lens's point as where far away lands (a part of the view's half
+ * width): the eye's move a is that times F / P00, the same scale for y, so
+ * the blur is round on the screen. */
 float input_view_roll(void);
-int photo_view(uint16_t *fov, float *roll);
+int photo_view(uint16_t *fov, float *roll, float *jit);
+void look_view(uint32_t id, uint32_t cam);  /* look.c: the right stick's look round the car turns the camera */
+static void photo_shear(uint32_t plat, const float *j){
+    float *V = (float *)(g_mem + plat), *Pr = V + 16, *M = V + 32;
+    float p00 = Pr[0], p11 = Pr[5], p23 = Pr[11];
+    static int said;
+    if (!said){                     /* once: the product is the view times the projection, as made here */
+        float e = 0.f;
+        for (int r = 0; r < 4; r++) for (int k = 0; k < 4; k++)
+            e = fmaxf(e, fabsf(M[r * 4 + k] - (V[r * 4] * Pr[k] + V[r * 4 + 1] * Pr[4 + k] + V[r * 4 + 2] * Pr[8 + k] + V[r * 4 + 3] * Pr[12 + k])));
+        said = 1;
+        fprintf(stderr, "[photo] the view's product made again: %s (off by %g); P00 %.3f P11 %.3f P23 %.3f\n",
+                e < 1e-3f ? "as the game's" : "NOT as the game's", (double)e, (double)p00, (double)p11, (double)p23);
+    }
+    Pr[8] += j[0] * p23 + (j[4] > 0.f ? j[2] * p00 / j[4] : 0.f);
+    Pr[9] += j[1] * p23 + (j[4] > 0.f ? j[3] * p11 / j[4] : 0.f);
+    for (int r = 0; r < 4; r++) for (int k = 0; k < 4; k++)
+        M[r * 4 + k] = V[r * 4] * Pr[k] + V[r * 4 + 1] * Pr[4 + k] + V[r * 4 + 2] * Pr[8 + k] + V[r * 4 + 3] * Pr[12 + k];
+}
 static void view_roll(uint32_t m, float a){
     float c = cosf(a), s = sinf(a);
     for (uint32_t r = m; r < m + 0x40u; r += 0x10u){
@@ -513,19 +579,34 @@ void sub_005c7ec0(CPU *c){
     uint32_t plat = c->ecx, view = MR32(c->esp + 4u);
 #ifdef __wasm__
     uint32_t cam = 0, fcam = 0; uint8_t keep[0x40]; uint16_t fov = 0, fkeep = 0;
+    float pj[5] = { 0 };
+    int shift = 0;
     if (view && mem_is_committed(view + 0x43u) && (MR32(view + 4u) == 1u || MR32(view + 4u) == 4u)){
+        look_view(MR32(view + 4u), MR32(view + 0x40u));     /* till after Present, for everything drawn */
         float a = input_view_roll(), pr = 0.f;
-        if (photo_view(&fov, &pr)){
+        if (photo_view(&fov, &pr, pj)){
             a += pr;
             fcam = MR32(view + 0x40u);
             if (fcam && mem_is_committed(fcam + 0xc5u)){ fkeep = MR16(fcam + 0xc4u); MR16(fcam + 0xc4u) = fov; }
             else fcam = 0;
+            shift = (pj[0] != 0.f || pj[1] != 0.f || pj[2] != 0.f || pj[3] != 0.f) && plat && mem_is_committed(plat + 0xbfu);
         }
-        cam = a != 0.f ? MR32(view + 0x40u) : 0u;
-        if (cam && mem_is_committed(cam + 0x3fu)){ memcpy(keep, g_mem + cam, sizeof keep); view_roll(cam, a); }
-        else cam = 0;
+        cam = a != 0.f || shift ? MR32(view + 0x40u) : 0u;
+        if (cam && mem_is_committed(cam + 0x3fu)){
+            memcpy(keep, g_mem + cam, sizeof keep);
+            if (a != 0.f) view_roll(cam, a);
+            if (shift){
+                /* the lens's point (far away's move, in half widths) as the eye's move in metres, round in the view:
+                 * times the focus distance over the projection's x scale (the view's own, as the last frame made it) */
+                float p00 = MRF32(plat + 0x40u), s = p00 > 0.05f && p00 < 50.f && pj[4] > 0.f ? pj[4] / p00 : 0.f;
+                pj[2] *= s; pj[3] *= s;
+                MRF32(cam + 0x30u) -= pj[2]; MRF32(cam + 0x34u) -= pj[3];
+            }
+        }
+        else { cam = 0; shift = 0; }
     }
     sub_005c7ec0_orig(c);
+    if (shift) photo_shear(plat, pj);
     if (cam) memcpy(g_mem + cam, keep, sizeof keep);
     if (fcam) MR16(fcam + 0xc4u) = fkeep;
 #else
@@ -681,12 +762,15 @@ void sub_005bc210(CPU *restrict c){
     g_cull_lifted++;
     sub_005bc210_orig(c);
 }
+static int g_pc_watch;             /* sub_005c5930's PARTCULL=2 check: count the parts found outside */
+static uint32_t g_pc_out;
 void sub_005bc300(CPU *restrict c){
 #ifdef __wasm__
-    if (frustum_native(c)) return;
+    if (frustum_native(c)){ if (g_pc_watch && !c->eax) g_pc_out++; return; }
 #endif
     g_cull_lifted++;
     sub_005bc300_orig(c);
+    if (g_pc_watch && !c->eax) g_pc_out++;
 }
 void sub_0048ac60(CPU *restrict c){
 #ifdef __wasm__
@@ -694,6 +778,83 @@ void sub_0048ac60(CPU *restrict c){
 #endif
     g_cull_lifted++;
     sub_0048ac60_orig(c);
+}
+/* --- sub_005c5930: a model's parts into the render lists --------------------
+ * (item, M, a3, flags, a5), thiscall (the view), ret 0x14.  The model
+ * [[item+0xC]] has [+0x10] parts of 0x3C bytes at [+0x14] (a box: lo at +0,
+ * hi at +0x10; +0x38 bit 0: never tested), and each is tested against the
+ * view (sub_005bc300(lo, hi, M) above: 0 outside, then left out) unless
+ * flags has bit 2.  ~30 models a car, tested part by part.  When the box
+ * round all of a model's tested parts is inside every plane of the view by
+ * a margin, so is each part's box (the same M), and the game's test of each
+ * would pass it: the model goes in with bit 2, its parts untested (7 models
+ * in 10 among 48 friends' cars, 4 parts each: ~0.2 ms a frame less).
+ * Anything else is tested as before.
+ * PARTCULL=0 off; PARTCULL=2 checks: such a model is tested as before, and
+ * a part found outside is counted ([partcull] lines). */
+void sub_005c5930_orig(CPU *c);
+static int g_pc_on = -1;
+static uint64_t g_pc_models, g_pc_fast, g_pc_parts, g_pc_bad;
+/* the box lo..hi, through M when M is not 0, inside the six planes at [th]+0xC0
+ * (n.x n.y n.z d; inside: n.p + d >= [0x7D7D3C] over the whole box) by a margin */
+static int pc_inside(uint32_t th, uint32_t M, const float lo[3], const float hi[3]){
+    float C[3], H[3], c0[3], h0[3];
+    for (int j = 0; j < 3; j++){ c0[j] = (hi[j] + lo[j]) * 0.5f; h0[j] = (hi[j] - lo[j]) * 0.5f; }
+    for (int j = 0; j < 3; j++){
+        if (!M){ C[j] = c0[j]; H[j] = h0[j]; continue; }
+        float cc = MRF32(M + 0x30u + 4u * (uint32_t)j), hh = 0;
+        for (int i = 0; i < 3; i++){
+            float m = MRF32(M + 16u * (uint32_t)i + 4u * (uint32_t)j);
+            cc += c0[i] * m; hh += h0[i] * __builtin_fabsf(m);
+        }
+        C[j] = cc; H[j] = hh;
+    }
+    float K = MRF32(0x007d7d3cu);
+    uint32_t p = MR32(th) + 0xc0u;
+    for (int k = 0; k < 6; k++, p += 16u){
+        float nx = MRF32(p), ny = MRF32(p + 4u), nz = MRF32(p + 8u), d = MRF32(p + 12u);
+        float s = C[0] * nx + C[1] * ny + C[2] * nz + d;
+        float r = __builtin_fabsf(nx) * H[0] + __builtin_fabsf(ny) * H[1] + __builtin_fabsf(nz) * H[2];
+        float tol = 0.01f + 1e-5f * (__builtin_fabsf(s) + r + __builtin_fabsf(d));   /* the game's float rounding, with room */
+        if (!(s - r > K + tol)) return 0;                                            /* (a NaN too) */
+    }
+    return 1;
+}
+void sub_005c5930(CPU *c){
+    if (g_pc_on < 0){ const char *e = getenv("PARTCULL"); g_pc_on = e ? atoi(e) : 1; }
+    uint32_t e = c->esp, item = MR32(e + 4u), fl = MR32(e + 16u);
+    uint32_t W = g_pc_on && item && !(fl & 4u) ? MR32(item + 0xcu) : 0;
+    uint32_t mdl = W ? MR32(W) : 0, n = mdl ? MR32(mdl + 0x10u) : 0, parts = n ? MR32(mdl + 0x14u) : 0;
+    if (!parts || n < 2u || n > 4096u){ sub_005c5930_orig(c); return; }
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    uint32_t tested = 0, fin = 1;
+    for (uint32_t i = 0, p = parts; i < n; i++, p += 0x3cu){
+        if (MR8(p + 0x38u) & 1u) continue;
+        for (int j = 0; j < 3; j++){
+            float a = MRF32(p + 4u * (uint32_t)j), b = MRF32(p + 0x10u + 4u * (uint32_t)j);
+            fin &= (uint32_t)(__builtin_fabsf(a) < 1e30f) & (uint32_t)(__builtin_fabsf(b) < 1e30f);
+            if (a < lo[j]) lo[j] = a;
+            if (b > hi[j]) hi[j] = b;
+        }
+        tested++;
+    }
+    g_pc_models++;
+    if (tested < 2u || !fin || !pc_inside(c->ecx, MR32(e + 8u), lo, hi)){ sub_005c5930_orig(c); return; }
+    g_pc_fast++; g_pc_parts += tested;
+    if (g_pc_on == 2){
+        uint32_t out0 = g_pc_out;
+        g_pc_watch = 1; sub_005c5930_orig(c); g_pc_watch = 0;
+        if (g_pc_out != out0){
+            g_pc_bad += g_pc_out - out0;
+            fprintf(stderr, "[partcull] model %08x: %u of %u part(s) outside, taken as inside\n", mdl, g_pc_out - out0, tested);
+        }
+        if ((g_pc_fast & 0x3ffffu) == 0)
+            fprintf(stderr, "[partcull] %llu models, %llu inside (%llu parts not tested), %llu wrong\n", (unsigned long long)g_pc_models,
+                    (unsigned long long)g_pc_fast, (unsigned long long)g_pc_parts, (unsigned long long)g_pc_bad);
+        return;
+    }
+    MR32(e + 16u) = fl | 4u;
+    sub_005c5930_orig(c);
 }
 
 /* --- sub_0068ce7c: D3DXMatrixMultiply, the SSE version ---------------------
@@ -800,6 +961,69 @@ void sub_004e8b70(CPU *c){
     int named = MR8(PROFILE_NAME + 0x20u) != 0;
     for (uint32_t i = 0; i < 32u; i++)
         MR8(self + MC_NAME + i) = stale ? 0xefu : named ? MR8(PROFILE_NAME + i) : 0u;
+}
+
+/* --- sub_004ff3b0: a first profile's name box starts with Your name ---
+ * The game's one text entry (0x83A7B0, input_web.c) is set up here (thiscall,
+ * ret 0x10: record, kind, text, most): the text goes to +0x100 (what is
+ * typed, and shown) and +0 (what it started with), its length to +0x200.  A
+ * new profile's name (0x556490: kind 6, letters and digits, 7 at most) starts
+ * with the game's text 0x818F0385, NAME in English (empty in some
+ * languages), and typing goes after it: hundreds of players kept NAME.  When
+ * the page finds no profile in the save folder it passes the name the player
+ * typed under Your name as NFSU2_NEW_PROFILE_NAME (shell.ts; never the digits
+ * the page may play under instead), and while no profile is loaded the box
+ * starts with its letters and digits.  The other kind-6 boxes (12 at most)
+ * stay as they are.
+ * The default itself is no name the field makes in six of the languages: in
+ * the Chinese, Japanese and Thai packs, in Korean, and in the Polish and
+ * Hungarian packs (NAME with an accented letter) it has bytes of the game's font that the
+ * field never takes (0x4FF310: letters and digits only), and what is typed
+ * goes after them.  A profile named so lives in a folder the I/O worker names
+ * by the path's UTF-8, with U+FFFD for those bytes, which the game reads back
+ * from the folder's listing as other bytes than the name inside; the page
+ * refused such a profile from a backup or the cloud (Discord 2026-11-02: a
+ * Chinese player's "<font bytes>ads", D6 8B 89 the pack's NAME).  So the box
+ * starts empty instead, as the game's own Chinese, Japanese and Thai text has
+ * it, whenever a profile is made (no Your name to put in its place). */
+#define TXT_TEXT         0x100u        /* what is typed (and shown); +0 what it started with */
+#define TXT_LEN          0x200u
+#define TXT_KIND         0x204u
+#define TXT_MOST         0x20cu
+#define NEW_PROFILE_MOST 7u
+uint32_t language_text(uint32_t hash);  /* language.c: the game's text by its hash, a guest address (0: none) */
+static int name_char(uint8_t b){ return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9'); }
+void sub_004ff3b0_orig(CPU *c);
+void sub_004ff3b0(CPU *c){
+    static const char *want;
+    static int got;
+    if (!got){ got = 1; want = getenv("NFSU2_NEW_PROFILE_NAME"); if (want && !*want) want = 0; }
+    uint32_t self = c->ecx;
+    sub_004ff3b0_orig(c);
+    if (!self || !mem_is_committed(self) || !mem_is_committed(self + TXT_MOST + 3u)) return;
+    if (MR32(self + TXT_KIND) != 6u || MR32(self + TXT_MOST) != NEW_PROFILE_MOST) return;
+    /* the game's start: empty, or its default name */
+    uint32_t def = language_text(0x818f0385u), len = MR32(self + TXT_LEN);
+    if (len){
+        if (!def || len > 32u || !mem_is_committed(def) || !mem_is_committed(def + len)) return;
+        for (uint32_t i = 0; i <= len; i++) if (MR8(def + i) != MR8(self + TXT_TEXT + i)) return;
+    }
+    char name[NEW_PROFILE_MOST]; uint32_t n = 0;
+    if (want && !MR8(PROFILE_NAME + 0x20u))
+        for (const char *p = want; *p && n < NEW_PROFILE_MOST; p++) if (name_char((uint8_t)*p)) name[n++] = *p;
+    if (!n){
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < len; i++) bad += !name_char(MR8(self + TXT_TEXT + i));
+        if (!bad) return;                    /* NAME, NOM, NAAM ...: the game's own start */
+    }
+    for (uint32_t i = 0; i < 0x100u; i++){
+        uint8_t b = i < n ? (uint8_t)name[i] : 0u;
+        MR8(self + TXT_TEXT + i) = b;
+        MR8(self + i) = b;
+    }
+    MR32(self + TXT_LEN) = n;
+    if (n) fprintf(stderr, "[profile] a new profile's name starts as Your name (NFSU2_NEW_PROFILE_NAME), not the game's default\n");
+    else fprintf(stderr, "[profile] a new profile's name starts empty: the game's default in this language (%u bytes) is no name its field makes\n", len);
 }
 
 /* --- sub_0050b410: FEng's level sorter, more than 512 objects a package ---

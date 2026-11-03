@@ -19,7 +19,7 @@
 #      ~/projects/nsfu2/Need for Speed - Underground 2 if it exists.  Ctrl-C stops it.
 # It prints the address for this Mac, http://localhost:<port>/; --open also opens
 # it in Chrome.  The server listens on this Mac only: other PCs need HTTPS, from
-# a certificate or a proxy or tunnel in front (docs/web/VPS.md).
+# a certificate or a proxy or tunnel in front (web/deploy/).
 # A build that fails stops here with its error (the last 40 lines; the whole log
 # is in out/web/server/), instead of starting the server with a stale or missing
 # module, page or server.
@@ -91,7 +91,7 @@ if [ "$BUILD" = 1 ]; then
     fi
   fi
   # ---- 3. the page ----
-  if [ ! -f web/dist/main.js ] || [ -n "$(find web/src web/index.html web/build.mjs app/registry-defaults.txt -newer web/dist/main.js -type f -print -quit 2>/dev/null || true)" ]; then
+  if [ ! -f web/dist/main.js ] || [ -n "$(find web/src web/index.html web/build.mjs app/registry-defaults.txt CHANGELOG.md -newer web/dist/main.js -type f -print -quit 2>/dev/null || true)" ]; then
     say "Building the page"
     if ! (cd web && node build.mjs) > "$STATE/page-build.log" 2>&1; then
       tail -40 "$STATE/page-build.log"

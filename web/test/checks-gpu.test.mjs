@@ -87,6 +87,9 @@ const CASES = [
   ['Firefox on Intel integrated graphics', { ua: UA.firefoxWin, gpu: adapter(undefined, {}), webgl: 'Intel(R) HD Graphics 400' }, 'warn', 'GPU-INTEGRATED-FIREFOX'],
   ['Firefox on a graphics card', { ua: UA.firefoxWin, gpu: adapter(undefined, {}), webgl: 'NVIDIA GeForce GTX 980 Direct3D11 vs_5_0 ps_5_0' }, 'ok', undefined],
   ['Chrome on a graphics card', { ua: UA.chromeWin, gpu: adapter() }, 'ok', undefined],
+  // Chrome's WebGPU flag hands out the processor's stand-in where it can't use the graphics (a Steam Deck: ~13 fps)
+  ['Chrome on Linux given SwiftShader', { ua: UA.chromeLinux, gpu: adapter(['texture-compression-bc'], { vendor: 'google', architecture: 'swiftshader', description: '' }) }, 'warn', 'GPU-SOFTWARE'],
+  ['Chrome on Windows given a fallback adapter', { ua: UA.chromeWin, gpu: adapter(undefined, { vendor: 'google', architecture: '', description: '', isFallbackAdapter: true }) }, 'warn', 'GPU-SOFTWARE'],
 ];
 
 for (const [name, b, state, code] of CASES) {
@@ -101,11 +104,17 @@ for (const [name, b, state, code] of CASES) {
 test('graphics check: the titles and the browser\'s name in the text', async () => {
   let c = await gpuCheck({ ua: UA.chromeWin, gpu: null, webgl: null });
   assert.equal(c.label, 'Graphics (WebGPU)');
+  // the text as written (td, the key the page translates) filled with the browser's name, not its wording
+  const filled = c => c.td.replace(/\{(\w+)\}/g, (m, k) => c.v[k]);
   c = await gpuCheck({ ua: UA.chromeMac, gpu: null });
-  assert.equal(c.detail, 'Chrome could not use this computer\'s graphics for the game. Restart Chrome; if that does not help, update Chrome and the system.');
+  assert.equal(c.code, 'GPU-ADAPTER');
+  assert.deepEqual(c.v, { browser: 'Chrome', Browser: 'Chrome' });
+  assert.equal(c.detail, filled(c));
+  assert.ok(c.detail.includes('Chrome'), c.detail);
   // Safari 26 with WebGPU but no adapter: "the browser", capitalised where it starts the sentence
   c = await gpuCheck({ ua: UA.safariMac, gpu: null });
-  assert.match(c.detail, /^The browser could not use .* Restart the browser; .* update the browser and the system\.$/);
+  assert.deepEqual(c.v, { browser: 'the browser', Browser: 'The browser' });
+  assert.equal(c.detail, filled(c));
   assert.equal(c.tl, 'Graphics (WebGPU)');
   c = await gpuCheck({ ua: UA.chromeWin, gpu: adapter() });
   assert.equal(c.label, 'Graphics: nvidia ampere');

@@ -107,7 +107,7 @@ int fileio_resolve_save(const char *win, char *out, size_t outsz);
 #define FN_REC_WRITE    0x00516620u   /* thiscall record (out, &left) -> out after it: a career car as the profile has it */
 #define FN_PARTS_READ   0x00504040u   /* thiscall record +0x434 (in, &left) -> in after them */
 #define FN_SET_CAR      0x00500bd0u   /* thiscall Career (handle): the car it drives */
-#define FN_DIALOG       0x00558790u   /* cdecl (package, "", 0xF770, 0x61C, yes, no, no, 0, text, %s, %s): two buttons */
+#define FN_DIALOG       0x00558750u   /* cdecl (package, "", 0xF770, 0x61C, yes, no, no, 0, format, ...): two buttons */
 #define FN_SHOW         0x00537c00u   /* cdecl (package, group, script name, 1) */
 #define FN_SELECT_MAKE  0x004ee210u   /* thiscall UI_CareerCarSelect: its list and the car shown, again */
 #define FN_HELPBAR_SET  0x0054e6e0u   /* thiscall help bar (buttons, package) */
@@ -134,6 +134,8 @@ int fileio_resolve_save(const char *win, char *out, size_t outsz);
 #define GARAGE_OLD      "GARAGE.OLD"
 #define GARAGE_MAGIC    0x4147324eu   /* "N2GA" */
 #define TRADE_PCT       80u
+
+uint32_t language_text(uint32_t hash);       /* language.c: a text of the game's, in its language */
 
 static uint32_t g_blk;            /* guest memory: our records (XN a player), a new one, scratch */
 #define X_AT(p)         (g_blk + (p) * XN * REC_SZ)
@@ -468,13 +470,25 @@ void sub_0052a4c0(CPU *c){
     if (differ(&g_now, &g_kept.st)){ c->eax = (c->eax & ~0xffu) | 1u; fprintf(stderr, "[garage] slots 6-10 changed: something to save\n"); }
 }
 
-/* fileio.c: the game has written a profile (host path): its GARAGE file beside it */
+/* the name of the profile player 1 loaded last ("" none yet), and how many loads of player 1's profile there were
+ * (the game's own load, or its going back to the payload it kept, 0x5347C0): mpcredit.c reads its file beside the
+ * profile again at each */
+static char g_profile[33];
+static unsigned g_p1_loads;
+const char *garage_profile_name(void){ return g_profile; }
+unsigned garage_profile_loads(void){ return g_p1_loads; }
+
+/* fileio.c: the game has written a profile (host path): its GARAGE file beside it (and mpcredit.c's wins that
+ * waited for a save of it) */
+void mpcredit_profile_written(const char *path);
+void mpcredit_profile_deleted(const char *path);
 void garage_profile_written(const char *path){
     static uint8_t f[PROFILE_SIZE];
     FILE *in = fopen(path, "rb");
     if (!in) return;
     size_t n = fread(f, 1, sizeof f, in); fclose(in);
     if (n != PROFILE_SIZE || memcmp(f, "20CM", 4)) return;
+    mpcredit_profile_written(path);              /* (a whole profile on disk: a failed write leaves its wins waiting) */
     const uint8_t *pl = f + PAYLOAD_AT;
     char name[33]; unsigned i = 0;
     for (; i < 32u && pl[P_NAME + i]; i++) name[i] = (char)pl[P_NAME + i];
@@ -506,6 +520,7 @@ void garage_profile_deleted(const char *path){
         snprintf(g, sizeof g, "%.*s/%s", sl ? (int)(sl - path) : 1, sl ? path : ".", files[i]);
         if (remove(g) == 0) fprintf(stderr, "[garage] %s deleted with its profile\n", g);
     }
+    mpcredit_profile_deleted(path);
 }
 
 /* slots 6-10 of the profile named name whose car part has fingerprint fp, 1:
@@ -545,12 +560,14 @@ void sub_00516850(CPU *c){
     sub_00516850_orig(c);
     g_loads++;
     int p = player_of(db);
+    if (p == 0) g_p1_loads++;
     if (p < 0 || !ensure(c)) return;
     if (!p) g_back.on = 0;
     xinit(c, db);
     char name[33] = "";
     uint64_t fp = fnv(in, CARS_PART);
     if (size >= P_NAME + 32u) name_of(in, name);
+    if (!p && name[0]) snprintf(g_profile, sizeof g_profile, "%s", name);
     if (g_kept.on && g_kept.p == p && in == MR32(FEDB + FEDB_KEPT) && fp == g_kept.fp && (!name[0] || !strcmp(name, g_kept.name))){
         load_state(c, db, &g_kept.st);
         fprintf(stderr, "[garage] back to the kept payload: slots 6-10 as then, %u cars of yours, %u of %u slots open\n",
@@ -663,8 +680,18 @@ static int trade_ask(CPU *c, uint32_t scr){
     uint32_t h = MR32(it + IT_HANDLE), r = garage_find(CARS0, h);
     if (!r || slot_of(CARS0, r) < 0 || !MR8(r + R_OWNED)) return 0;
     g_trade = h;
-    uint32_t a[11] = { MR32(scr + SC_PACKAGE), 0x00783fe5u, 0xf770u, 0x61cu, MSG_TRADE_YES, MSG_NO, MSG_NO, 0, TXT_TRADE_ASK, 0, 0 };
-    gcall(c, FN_DIALOG, 0, 11, a);
+    /* the dialog's text is a printf format, and the question's "80% of its cost" is no format: "%s" with it; the
+     * text it made is printed as a format once more on the screen, so with its % doubled ("80% of" was "800f") */
+    uint32_t q = language_text(TXT_TRADE_ASK), t = SCRATCH + 4u, n = 0;
+    if (!q) return 0;
+    MR8(SCRATCH) = '%'; MR8(SCRATCH + 1u) = 's'; MR8(SCRATCH + 2u) = 0;
+    for (uint32_t i = 0; MR8(q + i) && n + 3u < 0x400u; i++){
+        if (MR8(q + i) == '%') MR8(t + n++) = '%';
+        MR8(t + n++) = MR8(q + i);
+    }
+    MR8(t + n) = 0;
+    uint32_t a[10] = { MR32(scr + SC_PACKAGE), 0x00783fe5u, 0xf770u, 0x61cu, MSG_TRADE_YES, MSG_NO, MSG_NO, 0, SCRATCH, t };
+    gcall(c, FN_DIALOG, 0, 10, a);
     return 1;
 }
 static void trade(CPU *c, uint32_t scr){

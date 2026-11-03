@@ -84,6 +84,20 @@ test('names, addresses and the zone go; the rest stays as it was', () => {
   assert.equal(lines[34], '  --- native state applier (12 types 7/3/1, 0 left)');
 });
 
+test('messages between friends: the friend\'s name goes, the rest stays', () => {
+  const lines = new Privacy('salt').scrub(`[msg] from Night Owl
+[msg] from Night Owl, on the start page
+[msg] sending to Night Owl (12 characters)
+[msg] to Night Owl: kept
+[msg] to Night Owl from the start page: sent
+[msg] to Night Owl failed: TypeError: Failed to fetch
+`).split('\n');
+  const owl = /^\[msg\] from (player-\w{4})$/.exec(lines[0])?.[1];
+  assert.ok(owl, lines[0]);
+  assert.deepEqual(lines.slice(1, 6), [`[msg] from ${owl}, on the start page`, `[msg] sending to ${owl} (12 characters)`, `[msg] to ${owl}: kept`,
+    `[msg] to ${owl} from the start page: sent`, `[msg] to ${owl} failed: TypeError: Failed to fetch`]);
+});
+
 test('a stand-in holds in every log of a browser, and differs between browsers', () => {
   const a = new Privacy('one').scrub(LOG), b = new Privacy('one').scrub(LOG), c = new Privacy('two').scrub(LOG);
   assert.equal(a, b);
@@ -129,4 +143,22 @@ test('names the page tells it: a notice\'s friend, the profiles', () => {
   p.name('Kite Runner', 'player'); p.name('Player', 'you'); p.name('  ', 'room');
   const out = p.scrub('[notice] Kite Runner left\n[app] Player is the game\'s own default\n');
   assert.match(out, /^\[notice\] player-\w{4} left\n\[app\] Player is the game's own default\n$/);
+});
+
+test('a race that counts in the career: its friends, its winner and the note lose their names', () => {
+  // Quill9 and Ferro2 only as friends at the race's start (no results came), driver (a word of the log too) as the
+  // winner and in the note, Juno Lake (the free-roam name) only in the note
+  const log = [
+    '[4!] [mprace] f=4000 start: a win counts in the career; prize money $400/300/200/100; friends in the race: Quill9 Ferro2',
+    '[4!] [mprace] f=7000 the race in the career: our friend won it: it counts (place 2, winner driver, a friend, margin 0.00)',
+    '[4!] [roam] f=9000 race lobby: Multiplayer race: 2nd place. driver won it: it counts in your career too, $900',
+    '[4!] [roam] f=9100 race lobby: Multiplayer race: 2nd place. Juno Lake won it: it counts in your career too',
+    '[4!] [mprace] f=8000 Wren5 quits the race (its game says so)',
+    '[4!] [gpu] the driver is up to date',
+    '',
+  ].join('\n');
+  const out = new Privacy('salt').scrub(log);
+  for (const gone of ['Quill9', 'Ferro2', 'Wren5', 'winner driver', 'place. driver', 'Juno Lake']) assert.ok(!out.includes(gone), `${gone} is still in:\n${out}`);
+  assert.match(out, /friends in the race: player-\w{4} player-\w{4}\n/);
+  assert.ok(out.includes('[4!] [gpu] the driver is up to date'), 'the log\'s own word stays');
 });

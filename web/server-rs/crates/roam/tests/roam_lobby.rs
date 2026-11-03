@@ -97,26 +97,26 @@ fn the_world_map_brings_the_rooms_open_lobbies() {
     k.from(W(3), &lobby(103, 1, 0, 0xA5, 0x5555, 0, 0, 0, 6, &[103, 103]));
     k.hub.tick();
     k.clear();
-    k.from(W(0), &mapreq(100, 7));
+    k.from(W(0), &mapreq_base(100, 7, 2048, 0));
     assert_eq!(lobbies(&k), [(W(0), 7, vec![(50, -20, 0x2222, 2, 4, 1), (500, 0, 0x1111, 1, 6, 0)])]);
     // without the flag: the map, no lobbies; another room: its own
     k.clear();
-    k.from(W(3), &mapreq(103, 1));
+    k.from(W(3), &mapreq_base(103, 1, 2048, 0));
     assert!(lobbies(&k).is_empty() && !k.sent.lock().is_empty(), "a player that takes none gets its map only");
     k.clear();
-    k.from(W(4), &mapreq(104, 1));
+    k.from(W(4), &mapreq_base(104, 1, 2048, 0));
     assert_eq!(lobbies(&k), [(W(4), 1, vec![(0, 0, 0x4444, 1, 6, 0)])]);
     // 1 closes its lobby (another id closes nothing), 2's advert goes stale: none listed
     k.from(W(2), &lobby(102, 5, 0, 0xFF, 0x2222, 50, -20, 1, 4, &[]));
     k.from(W(1), &lobby(101, 5, 0, 0xA1, 0x1111, 500, 0, 0, 6, &[]));
     k.step(1100.0);
     k.clear();
-    k.from(W(0), &mapreq(100, 8));
+    k.from(W(0), &mapreq_base(100, 8, 2048, 0));
     assert_eq!(lobbies(&k), [(W(0), 8, vec![(50, -20, 0x2222, 2, 4, 1)])], "only 2's, closed with another id");
     k.step(3100.0);
     k.from(W(0), &snap(100, [0.0, 0.0, 0.0]));
     k.clear();
-    k.from(W(0), &mapreq(100, 9));
+    k.from(W(0), &mapreq_base(100, 9, 2048, 0));
     assert_eq!(lobbies(&k), [(W(0), 9, vec![])], "a stale advert is a lobby gone");
 }
 
@@ -131,12 +131,12 @@ fn a_blocked_hosts_lobby_is_not_listed() {
     }
     k.from(W(1), &lobby(101, 1, 0, 0xA1, 0x1111, 500, 0, 0, 6, &[101]));
     k.clear();
-    k.from(W(0), &mapreq(100, 7));
+    k.from(W(0), &mapreq_base(100, 7, 2048, 0));
     assert_eq!(lobbies(&k), [(W(0), 7, vec![(500, 0, 0x1111, 1, 6, 0)])]);
     k.hub.blocks(W(0), vec!["P".into()]);
     k.step(1100.0);
     k.clear();
-    k.from(W(0), &mapreq(100, 8));
+    k.from(W(0), &mapreq_base(100, 8, 2048, 0));
     assert_eq!(lobbies(&k), [(W(0), 8, vec![])]);
 }
 
@@ -161,12 +161,12 @@ fn a_lobby_is_not_there_for_one_kept_apart_from_its_players() {
             assert!(link(&k, 0, member) && !link(&k, 0, outsider) && !link(&k, outsider, 0), "{way}: not carl and {outsider}");
             assert!(!link(&k, 1, 2) && link(&k, 3, 0) && link(&k, 3, 1) && link(&k, 3, 2), "{way}: dave with all of them");
             k.clear();
-            k.from(W(outsider), &mapreq(100 + outsider, 1));
-            let map: Vec<_> = k.sent.lock().iter().filter_map(|(_, f)| map_of(f)).flat_map(|m| m.4).collect();
+            k.from(W(outsider), &mapreq_base(100 + outsider, 1, 2048, 0));
+            let map: Vec<_> = k.sent.lock().iter().filter_map(|(_, f)| mapd_of(f)).flat_map(|m| m.5).collect();
             assert_eq!(lobbies(&k), [(W(outsider), 1, vec![])], "{way}: no lobby on {outsider}'s map");
-            assert!(!map.iter().any(|e| e.0 == 0), "{way}: nor carl: {map:?}");
+            assert!(!map.iter().any(|e| e.1.is_some_and(|p| p.0 == 0)), "{way}: nor carl: {map:?}");
             k.clear();
-            k.from(W(3), &mapreq(103, 1));
+            k.from(W(3), &mapreq_base(103, 1, 2048, 0));
             assert_eq!(lobbies(&k).first().map(|l| l.2.len()), Some(1), "{way}: dave sees it");
             // the member leaves the lobby
             k.step(600.0);
@@ -223,7 +223,7 @@ fn lobbies_on_the_wire_roam_core_and_the_hub_agree() {
     assert_eq!(ad[16 + 23], 25, "the host's away seconds in the byte after n, once reserved: the hub takes the advert all the same");
     k.from(W(0), &ad);
     k.clear();
-    k.from(W(1), &mapreq(101, 1));
+    k.from(W(1), &mapreq_base(101, 1, 2048, 0));
     assert_eq!(lobbies(&k), [(W(1), 1, vec![(-1234, 567, 0x0BADF00D, 2, 6, 0)])]);
     // the hub's datagrams to a C session that asks (req 1): it holds the lobby
     let frames: Vec<String> = k.sent.lock().iter().map(|(_, f)| hex(&f[16..])).collect();
@@ -316,6 +316,12 @@ fn a_lobbys_host_is_linked_with_its_players_and_the_ones_at_its_start_first() {
 /// 3 zero bytes; rating, field, factor, kW, kg, km/h, time; the name in 16 bytes
 #[allow(clippy::too_many_arguments)]
 fn racerep(sender: u32, lobby: u32, place: u8, players: u8, flags: u8, rating: f32, name: &[u8], payload_len: usize) -> Vec<u8> {
+    racerep_in(sender, lobby, place, players, flags, rating, name, payload_len, 0.0)
+}
+
+/// `racerep` with the reporter's time (s)
+#[allow(clippy::too_many_arguments)]
+fn racerep_in(sender: u32, lobby: u32, place: u8, players: u8, flags: u8, rating: f32, name: &[u8], payload_len: usize, time: f32) -> Vec<u8> {
     let mut p = vec![0u8; payload_len];
     p[0..4].copy_from_slice(&lobby.to_le_bytes());
     p[4..8].copy_from_slice(&0x0BADF00Du32.to_le_bytes());
@@ -327,7 +333,7 @@ fn racerep(sender: u32, lobby: u32, place: u8, players: u8, flags: u8, rating: f
     p[14] = flags;
     p[15] = 0;
     p[16] = 3;
-    for (k, v) in [rating, 241.4, 1.0, 128.0, 1055.0, 256.0, 0.0].iter().enumerate() {
+    for (k, v) in [rating, 241.4, 1.0, 128.0, 1055.0, 256.0, time].iter().enumerate() {
         p[20 + 4 * k..24 + 4 * k].copy_from_slice(&v.to_le_bytes());
     }
     p[48..48 + name.len()].copy_from_slice(name);
@@ -362,7 +368,7 @@ fn race_reports_are_logged_once_a_race() {
     for (what, d) in [
         ("a place past its cars", racerep(100, 0xA4, 3, 2, 0, 239.3, b"PEUGOT", 64)),
         ("no cars", racerep(100, 0xA4, 0, 0, 0, 239.3, b"PEUGOT", 64)),
-        ("an unknown flag", racerep(100, 0xA4, 1, 2, 4, 239.3, b"PEUGOT", 64)),
+        ("an unknown flag", racerep(100, 0xA4, 1, 2, 8, 239.3, b"PEUGOT", 64)),
         ("a rating out of range", racerep(100, 0xA4, 1, 2, 0, 9999.0, b"PEUGOT", 64)),
         ("a rating not a number", racerep(100, 0xA4, 1, 2, 0, f32::NAN, b"PEUGOT", 64)),
         ("an unprintable name", racerep(100, 0xA4, 1, 2, 0, 239.3, b"PE\x07GOT", 64)),
@@ -375,6 +381,109 @@ fn race_reports_are_logged_once_a_race() {
     k.from(W(0), &racerep(100, 0xA4, 1, 2, 1, 239.3, b"PEUGOT", 64));
     assert!(k.lines.lock()[0].contains(": Ann (host) 1st of 2;"), "{:?}", k.lines.lock());
     assert_eq!(k.info("raceReports"), 3.0);
+}
+
+// a car no tuning makes (an edited save's: nfsu2.xyz, 2026-10-30, a 350Z of 2351 kW rated 5000) is a [cheat] line
+// besides its [race] line, which `nfsu2-server ctl ban` takes by its handle; a car of the game's best is none
+#[test]
+fn an_edited_car_in_a_race_is_a_cheat_line() {
+    let mut k = Kit::new(RoamOptions::default());
+    k.from(W(0), &hello_with(100, &HelloOpts { core: 5, name: b"Ed", ..Default::default() }));
+    k.from(W(0), &racerep(100, 0xA1, 1, 3, 0, 804.0, b"COROLLA", 64));
+    assert_eq!(k.lines.lock().len(), 1, "{:?}", k.lines.lock());
+    k.lines.lock().clear();
+    k.step(25000.0);
+    k.from(W(0), &racerep(100, 0xA2, 1, 3, 0, 5000.0, b"350Z", 64));
+    let lines = k.lines.lock().clone();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("[race] lobby 000000a2"), "{lines:?}");
+    let want = "\"Ed\": raced in the race of lobby 000000a2 (race 0badf00d: drag, 1 lap) in an edited car, 1st of 3: 350Z \
+                (type 0), 128 kW, 1055 kg, 256 km/h, rated 5000; no car of the game makes 600 kW, 420 km/h or a rating of 1000; \
+                no time to compare";
+    assert!(lines[1].starts_with("[cheat] ") && lines[1].ends_with(want), "{lines:?}");
+    assert_eq!(k.info("cheatLines"), 1.0);
+}
+
+// a car whose game data is edited (RC_RR_EDITED: its type's record in the browser's copy of GlobalB not the game's, a
+// guide passed among players, 2026-10-31) is a [cheat] line when its time beat 95 % of the honest cars' rated like it in
+// the same race; one no quicker than them, or with too few to compare, only adds that to its [race] line (an edit may
+// gain nothing); with numbers no tuning makes it is a [cheat] line however quick, saying what its time beat
+#[test]
+fn a_car_of_edited_game_data_in_a_race_is_a_cheat_line_when_it_gained() {
+    let mut k = Kit::new(RoamOptions::default());
+    k.from(W(0), &hello_with(100, &HelloOpts { core: 5, name: b"Ed", ..Default::default() }));
+    let rep = |lobby: u32, place: u8, flags: u8, rating: f32, time: f32| racerep_in(100, lobby, place, 3, flags, rating, b"SUPRA", 64, time);
+    // too few honest times of the race yet: a note on its [race] line
+    k.from(W(0), &rep(0xA0, 2, 4, 239.3, 35.0));
+    let lines = k.lines.lock().clone();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].ends_with("; its game has the car's data edited (GlobalB), no gain seen: its 35.00 s: too few honest times of this race to compare it with"),
+        "{lines:?}"
+    );
+    k.lines.lock().clear();
+    // twelve honest cars of its rating (30 .. 41 s) and one far stronger, a quick one (20 s): theirs are compared
+    for i in 1..=13u32 {
+        let name = format!("H{i}").into_bytes();
+        k.from(W(i), &hello_with(100 + i, &HelloOpts { core: 5, name: &name, ..Default::default() }));
+        let (rating, time) = if i == 13 { (700.0, 20.0) } else { (230.0, 29.0 + i as f32) };
+        k.from(W(i), &racerep_in(100 + i, 0xB0 + i, 1, 3, 0, rating, b"COROLLA", 64, time));
+    }
+    assert_eq!(k.lines.lock().len(), 13, "their [race] lines only, {:?}", k.lines.lock());
+    k.lines.lock().clear();
+    k.step(25000.0);
+    k.from(W(0), &rep(0xA1, 2, 4, 239.3, 35.0));
+    let lines = k.lines.lock().clone();
+    assert_eq!(lines.len(), 1, "as quick as the honest cars of its rating: no [cheat] line, {lines:?}");
+    assert!(
+        lines[0].ends_with(
+            "; its game has the car's data edited (GlobalB), no gain seen: its 35.00 s beat 50 % of the 12 honest cars rated \
+             179-299 in this race (their median 36.00 s)"
+        ),
+        "{lines:?}"
+    );
+    k.lines.lock().clear();
+    k.step(25000.0);
+    k.from(W(0), &rep(0xA2, 1, 5, 239.3, 25.0));
+    let lines = k.lines.lock().clone();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].contains(": Ed (host) 1st of 3 in 25.00 s;") && !lines[0].contains("GlobalB"), "{lines:?}");
+    let want = "\"Ed\": raced in the race of lobby 000000a2 (race 0badf00d: drag, 1 lap) in an edited car, 1st of 3: SUPRA \
+                (type 0), 128 kW, 1055 kg, 256 km/h, rated 239; its game has the car's data edited (GlobalB); its 25.00 s beat \
+                all 12 honest cars rated 179-299 in this race (their median 36.00 s)";
+    assert!(lines[1].starts_with("[cheat] ") && lines[1].ends_with(want), "{lines:?}");
+    k.lines.lock().clear();
+    // a strong car beats most of any rating's: that never decides
+    k.step(25000.0);
+    k.from(W(0), &rep(0xA3, 1, 4, 650.0, 25.0));
+    let lines = k.lines.lock().clone();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].ends_with(
+            "no gain seen: its 25.00 s beat 92 % of the 13 honest cars of any rating (too few rated like it) in this race \
+             (their median 35.00 s)"
+        ),
+        "{lines:?}"
+    );
+    k.lines.lock().clear();
+    k.step(25000.0);
+    k.from(W(0), &rep(0xA4, 3, 4, 5000.0, 45.0));
+    let lines = k.lines.lock().clone();
+    assert!(
+        lines[1].ends_with(
+            "rated 5000; its game has the car's data edited (GlobalB); no car of the game makes 600 kW, 420 km/h or a \
+             rating of 1000; its 45.00 s beat 0 % of the 13 honest cars of any rating (too few rated like it) in this race \
+             (their median 35.00 s)"
+        ),
+        "{lines:?}"
+    );
+    k.lines.lock().clear();
+    k.step(25000.0);
+    k.from(W(0), &racerep_in(100, 0xA5, 1, 1, 4, 239.3, b"SUPRA", 64, 20.0));
+    let lines = k.lines.lock().clone();
+    assert_eq!(lines.len(), 1, "alone in its race: the [race] line only, {lines:?}");
+    assert!(!lines[0].contains("GlobalB"), "{lines:?}");
+    assert_eq!(k.info("cheatLines"), 2.0);
 }
 
 // the wire: roam_core's report is the hub's line
@@ -417,4 +526,22 @@ fn race_reports_on_the_wire_roam_core_and_the_hub_agree() {
         ["[race] lobby a1b2c3d4, race 0badf00d (sprint, track 4102, 1 lap, 3 cars): Ann K. (host) 2nd of 3 in 95.50 s; 350Z (type 22), \
           class 2, rating 316.6 (the cars' average 280.5), 214 kW, 1450 kg, 249 km/h, power x1.250"]
     );
+}
+
+// a race that counted in the reporter's career (the report's credit byte, p[17]) says so at the end of its line
+#[test]
+fn a_race_that_counted_in_the_career_says_so() {
+    let mut k = Kit::new(RoamOptions::default());
+    k.from(W(0), &hello_with(100, &HelloOpts { core: 5, name: b"Ann", ..Default::default() }));
+    let mut d = racerep(100, 0xA3, 1, 2, 0, 239.3, b"PEUGOT", 64);
+    // (the payload after the datagram's 16-byte header: its byte +17; then the CRC again, kit::dgram's way)
+    d[16 + 17] = 2;
+    let n = d.len();
+    let crc = crc32fast::hash(&d[..n - 4]);
+    d[n - 4..].copy_from_slice(&crc.to_le_bytes());
+    k.from(W(0), &d);
+    let lines = k.lines.lock().clone();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("[race] lobby 000000a3"), "{lines:?}");
+    assert!(lines[0].ends_with("power x1.000; a friend's win in the career"), "{lines:?}");
 }

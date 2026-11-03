@@ -15,7 +15,7 @@
 
 /** the game's languages (runtime/language.c), settings.ini language's values; english is the default */
 export const LANGUAGES = ['english', 'french', 'german', 'italian', 'spanish', 'dutch', 'swedish', 'danish', 'korean',
-  'chinese', 'japanese', 'russian', 'thai', 'portuguese', 'polish', 'turkish'] as const;
+  'chinese', 'japanese', 'russian', 'thai', 'portuguese', 'polish', 'turkish', 'hungarian', 'ukrainian'] as const;
 export type Language = typeof LANGUAGES[number];
 type Forms = Partial<Record<Intl.LDMLPluralRule, string>>;
 export type Vars = Record<string, string | number>;
@@ -25,12 +25,13 @@ export type Vars = Record<string, string | number>;
 export const LOCALE: Record<Language, string> = {
   english: 'en', french: 'fr', german: 'de', italian: 'it', spanish: 'es', dutch: 'nl', swedish: 'sv', danish: 'da',
   korean: 'ko', chinese: 'zh-Hant', japanese: 'ja', russian: 'ru', thai: 'th', portuguese: 'pt-BR', polish: 'pl', turkish: 'tr',
+  hungarian: 'hu', ukrainian: 'uk',
 };
 /** each language in its own words (the pickers) */
 export const NATIVE: Record<Language, string> = {
   english: 'English', french: 'Français', german: 'Deutsch', italian: 'Italiano', spanish: 'Español', dutch: 'Nederlands',
   swedish: 'Svenska', danish: 'Dansk', korean: '한국어', chinese: '繁體中文', japanese: '日本語', russian: 'Русский', thai: 'ไทย',
-  portuguese: 'Português (Brasil)', polish: 'Polski', turkish: 'Türkçe',
+  portuguese: 'Português (Brasil)', polish: 'Polski', turkish: 'Türkçe', hungarian: 'Magyar', ukrainian: 'Українська',
 };
 
 let current: Language = 'english';
@@ -93,6 +94,11 @@ export function listOf(items: string[]): string {
 /** x as a percentage in the page's language (1.25: 125 %) */
 export function percent(x: number): string {
   return new Intl.NumberFormat(current === 'english' ? 'en-GB' : LOCALE[current], { style: 'percent' }).format(x);
+}
+
+/** a whole number in the page's language, its thousands grouped (7592: 7,592; 7.592 in German) */
+export function count(n: number): string {
+  return new Intl.NumberFormat(current === 'english' ? 'en-GB' : LOCALE[current]).format(n);
 }
 
 /** f again whenever the page's language changes */

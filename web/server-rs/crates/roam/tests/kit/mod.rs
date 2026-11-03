@@ -65,8 +65,10 @@ pub fn dgram_flags(kind: u8, sender: u32, flags: u16, payload: &[u8]) -> Vec<u8>
 
 /// the HELLO flag of a player that reads crews (roam_core.h RC_HF_CREW)
 pub const HF_CREW: u16 = 0x0200;
-/// the HELLO flag of a player that reads the crew marks of the hub's lists (roam_core.h RC_HF_HUBCREW, core 8)
+/// ...and of one that reads the hub's crew marks (roam_core.h RC_HF_HUBCREW: every core of now)
 pub const HF_HUBCREW: u16 = 0x0400;
+/// a crew mark's bit for a friend (roam_core.h RC_MARK_FRIEND)
+pub const MARK_FRIEND: u8 = 0x80;
 
 pub struct HelloOpts<'a> {
     pub room: u32,
@@ -78,13 +80,19 @@ pub struct HelloOpts<'a> {
     /// its crews: with them the HELLO has the crew flag and ends with them (a count, the hashes); None, a HELLO of
     /// before
     pub crews: Option<&'a [u32]>,
-    /// it reads the crew marks of the hub's lists (HF_HUBCREW, with HF_CREW), as a core of version 8 does
-    pub hubcrew: bool,
+    /// flags besides the crew flag (HF_HUBCREW)
+    pub flags: u16,
+    /// the links it wants (core version 10): a byte after the crews (with none, a count of 0 and the crew flag); 0
+    /// none
+    pub links: u8,
+    /// the other player of its outrun (core version 11): its id after the links byte (that byte 0 if no links are
+    /// said); 0 none
+    pub duel: u32,
 }
 
 impl Default for HelloOpts<'_> {
     fn default() -> Self {
-        HelloOpts { room: 0, status: 2, name: b"p", seen: &[], cfg_rev: 3, core: 1, crews: None, hubcrew: false }
+        HelloOpts { room: 0, status: 2, name: b"p", seen: &[], cfg_rev: 3, core: 9, crews: None, flags: 0, links: 0, duel: 0 }
     }
 }
 
@@ -104,13 +112,22 @@ pub fn hello_with(sender: u32, o: &HelloOpts) -> Vec<u8> {
         let at = 14 + nl + 4 * i;
         p[at..at + 4].copy_from_slice(&s.to_le_bytes());
     }
-    let hub = if o.hubcrew { HF_CREW | HF_HUBCREW } else { 0 };
-    let Some(crews) = o.crews else { return dgram_flags(1, sender, hub, &p) };
+    let crews = match o.crews {
+        Some(c) => c,
+        None if o.links > 0 || o.duel != 0 => &[],
+        None => return dgram_flags(1, sender, o.flags, &p),
+    };
     p.push(crews.len() as u8);
     for c in crews {
         p.extend_from_slice(&c.to_le_bytes());
     }
-    dgram_flags(1, sender, HF_CREW | hub, &p)
+    if o.links > 0 || o.duel != 0 {
+        p.push(o.links);
+    }
+    if o.duel != 0 {
+        p.extend_from_slice(&o.duel.to_le_bytes());
+    }
+    dgram_flags(1, sender, HF_CREW | o.flags, &p)
 }
 
 pub fn hello(sender: u32) -> Vec<u8> {
@@ -134,6 +151,24 @@ pub fn snap(sender: u32, pos: [f64; 3]) -> Vec<u8> {
     snap_n(sender, pos, 2, 1)
 }
 
+/// a SNAP of one state with a velocity, a heading (radians, 0 = +x, a turn about z) and its nose `slope` up (a
+/// tangent: 0.1 for 10 %)
+pub fn snap_pose(sender: u32, pos: [f64; 3], v: [f64; 3], heading: f64, slope: f64, status: u8) -> Vec<u8> {
+    let mut d = snap_moving(sender, pos, v, heading, status);
+    // the turn about z, then the nose up about the car's left (y): q = yaw * pitch
+    let (sz, cz) = ((heading / 2.0).sin(), (heading / 2.0).cos());
+    let (sy, cy) = ((-slope.atan() / 2.0).sin(), (-slope.atan() / 2.0).cos());
+    let q = [-sz * sy, cz * sy, sz * cy, cz * cy];
+    let p = &mut d[16..];
+    for (k, x) in q.iter().enumerate() {
+        p[34 + 2 * k..36 + 2 * k].copy_from_slice(&((x * 32767.0).round() as i16).to_le_bytes());
+    }
+    let len = d.len();
+    let crc = crc32fast::hash(&d[..len - 4]);
+    d[len - 4..].copy_from_slice(&crc.to_le_bytes());
+    d
+}
+
 /// a SNAP of one state with a velocity and a heading (radians, 0 = +x, a turn about z)
 pub fn snap_moving(sender: u32, pos: [f64; 3], v: [f64; 3], heading: f64, status: u8) -> Vec<u8> {
     let mut d = snap_n(sender, pos, status, 1);
@@ -151,36 +186,29 @@ pub fn snap_moving(sender: u32, pos: [f64; 3], v: [f64; 3], heading: f64, status
     d
 }
 
-/// the world map's question (MAPREQ), as a page before 2048 asks it (512 at most)
-pub fn mapreq(sender: u32, req: u16) -> Vec<u8> {
-    dgram(10, sender, &req.to_le_bytes())
-}
-
-/// the world map's question (MAPREQ) for max players at most
-pub fn mapreq_max(sender: u32, req: u16, max: u16) -> Vec<u8> {
-    dgram(10, sender, &[req.to_le_bytes(), max.to_le_bytes()].concat())
-}
-
-/// a MAP datagram: (req, part, nparts, total, [(x, y, heading)])
-pub type Map = (u16, u8, u8, u16, Vec<(i16, i16, u8)>);
-
-/// the MAP datagram in a frame of the hub's
-pub fn map_of(f: &[u8]) -> Option<Map> {
-    let d = &f[16..];
-    if d[5] != 11 {
-        return None;
-    }
-    let n = d[22] as usize;
-    let e = (0..n).map(|i| {
-        let o = 23 + 5 * i;
-        (i16::from_le_bytes([d[o], d[o + 1]]), i16::from_le_bytes([d[o + 2], d[o + 3]]), d[o + 4])
-    });
-    Some((u16::from_le_bytes([d[16], d[17]]), d[18], d[19], u16::from_le_bytes([d[20], d[21]]), e.collect()))
-}
-
-/// the world map's question of a page since MAPD: for max players at most, what changed since its answer base
+/// the world map's question (MAPREQ): for max players at most, what changed since its answer base (0: none)
 pub fn mapreq_base(sender: u32, req: u16, max: u16, base: u16) -> Vec<u8> {
     dgram(10, sender, &[req.to_le_bytes(), max.to_le_bytes(), base.to_le_bytes()].concat())
+}
+
+/// ...with flags (1: the players parked a minute have 0x4000 in their keys)
+pub fn mapreq_flags(sender: u32, req: u16, max: u16, base: u16, flags: u16) -> Vec<u8> {
+    dgram(10, sender, &[req.to_le_bytes(), max.to_le_bytes(), base.to_le_bytes(), flags.to_le_bytes()].concat())
+}
+
+/// the minimap's question (NEARREQ): for max players at most within radius m, what changed since its answer base
+pub fn nearreq(sender: u32, req: u16, max: u16, base: u16, radius: u16) -> Vec<u8> {
+    dgram(18, sender, &[req.to_le_bytes(), max.to_le_bytes(), base.to_le_bytes(), radius.to_le_bytes()].concat())
+}
+
+/// the minimap's answer (NEARD) in a frame of the hub's, read as a MAPD's
+pub fn neard_of(f: &[u8]) -> Option<Mapd> {
+    if f[16 + 5] != 19 {
+        return None;
+    }
+    let mut g = f.to_vec();
+    g[16 + 5] = 17;
+    mapd_of(&g)
 }
 
 /// a MAPD entry: the player's key, and where it is placed (x, y, heading, vx, vy), or None: gone
@@ -195,6 +223,7 @@ pub fn mapd_of(f: &[u8]) -> Option<Mapd> {
         return None;
     }
     let (mut o, mut e) = (25, Vec::new());
+    let place = if u16::from_le_bytes([d[14], d[15]]) & 0x0800 != 0 { 11 } else { 9 }; // (with heights)
     for _ in 0..d[24] {
         let key = u16::from_le_bytes([d[o], d[o + 1]]);
         if key & 0x8000 != 0 {
@@ -203,7 +232,7 @@ pub fn mapd_of(f: &[u8]) -> Option<Mapd> {
         } else {
             let i = |k: usize| i16::from_le_bytes([d[o + k], d[o + k + 1]]);
             e.push((key, Some((i(2), i(4), d[o + 6], d[o + 7] as i8, d[o + 8] as i8))));
-            o += 9;
+            o += place;
         }
     }
     assert_eq!(o + 4, d.len(), "MAPD entries fill the datagram");

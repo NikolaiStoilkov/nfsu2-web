@@ -8,20 +8,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const hasWasi = fs.readdirSync(path.join(REPO, 'deps')).some(d => d.startsWith('wasi-sdk-'));
-const sh = (script, env = {}) => spawnSync('bash', [path.join(REPO, script)], { cwd: REPO, encoding: 'utf8', env: { ...process.env, ...env } });
+const sh = (script, env = {}) => spawnSync('bash', [path.join(REPO, script)], { cwd: REPO, encoding: 'utf8', timeout: 300_000, env: { ...process.env, ...env } });
 
 test('aliasguard: the guest access macros keep their may_alias types', { skip: !hasWasi && 'no wasi-sdk in deps/' }, () => {
   const r = sh('web/tools/aliasguard.sh');
   console.log(r.stdout.trim());
   assert.equal(r.status, 0, r.stdout + r.stderr);
   // a cpu.h whose 16- and 64-bit accesses lost the type: the guard refuses it
-  const dir = fs.mkdtempSync(path.join(REPO, 'out/web/aliasguard-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aliasguard-'));
   try {
     const h = fs.readFileSync(path.join(REPO, 'runtime/cpu.h'), 'utf8')
       .replace(/\(gm_u16 +\*\)/g, '(uint16_t *)').replace(/\(gm_u64 +\*\)/g, '(uint64_t *)').replace(/\(gm_f64 +\*\)/g, '(double *)');

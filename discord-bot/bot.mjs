@@ -7,15 +7,17 @@
 // threads whose problem one of its commits fixes get a look ('fix live'), and a careful "may be fixed, reload" when the
 // look is sure; suggestions one of its commits carries out, also old ones, get 'implemented': "added, reload", Complete.
 //   node --env-file=.env bot.mjs        (settings: README.md)
-import { ChannelType, Client, Events, GatewayIntentBits, Partials, PermissionFlagsBits } from 'discord.js';
+import { ChannelType, Client, Events, GatewayIntentBits, Partials, PermissionFlagsBits, Routes } from 'discord.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Archive } from './archive.mjs';
 import { matchFeatures, matchFixes } from './fixes.mjs';
 import { General } from './general.mjs';
-import { blocks, investigate, newClient, overlap, picture, vet } from './investigate.mjs';
+import { COMMAND as FAQ, Faq, PREFIX as FAQ_BUTTON } from './faq.mjs';
+import { blocks, firstPass, investigate, newClient, overlap, picture, vet } from './investigate.mjs';
 import { Repo, defaultSource } from './repo.mjs';
+import { folderTops, samePlace } from './sigs.mjs';
 import { Spend, metered } from './spend.mjs';
 import { Tags } from './tags.mjs';
 import { COMMAND as TRANSLATE, Translator } from './translate.mjs';
@@ -34,7 +36,7 @@ const CFG = {
   waitS: Number(env.BOT_WAIT_S || 120),
   maxReplies: Number(env.BOT_MAX_REPLIES || 2),
   maxTalk: Number(env.BOT_MAX_TALK || 4),        // replies per thread in all, answering people who reply to the bot
-  budget: Number(env.BOT_BUDGET || 200),         // $ a month (UTC) for every model call; the looks wait when it runs short
+  budget: Number(env.BOT_BUDGET || 400),         // $ a month (UTC) for every model call; the looks wait when it runs short
   minConfidence: env.BOT_MIN_CONFIDENCE || 'medium',
   archive: env.BOT_ARCHIVE !== '0',
   state: path.resolve(HERE, env.BOT_STATE || 'state'),
@@ -60,12 +62,13 @@ const thanks = m => !m.attachments.size && THANKS.test(m.content);
 const MAX_WAIT_MS = 10 * 60_000;                 // a thread that keeps growing is looked at after 10 minutes anyway
 const STARTUP_MS = 48 * 3600_000;                // at start, the forums' posts of the last 48 hours, nothing older
 const RELEASE_CHECK_MS = 5 * 60_000;             // how often the bot checks whether a new version went live
-const FIX_DAYS = 14, FIX_MAX = 3;                // a release is checked against threads of the last 14 days, 3 looks at most
+const FIX_DAYS = 14, FIX_MAX = 15;               // a release is checked against threads of the last 14 days, 15 looks at most
 const FIX_EFFORT = 'low', FIX_TURNS = 8;          // a fix check reads one commit against one thread: a short look
 const FEATURE_MAX = 5;                           // a release is checked against every open suggestion, 5 looks at most
 const SUGGESTIONS = /suggest/i;                  // the suggestion forums, by name
 const SUGGESTION_INDEX = 500;                    // a release reads the newest 500 archived threads of each of them
 const SUGGESTION_DAYS = 365;                     // suggestions are kept in threads.json this long, other threads 30 days
+const VOTES_MS = 3 * 3600_000;                   // how often the suggestions' votes (reactions, messages, people) are counted
 const BUMP_QUIET_MS = 12 * 3600_000;             // the poster writing after this long a silence is a bump: they wait
 const REPEAT = 0.5;                              // a reply whose word pairs the bot's earlier messages hold this much of
 
@@ -75,9 +78,10 @@ const VERDICTS = path.join(CFG.state, 'verdicts.jsonl');
 const LIVE_FILE = path.join(CFG.state, 'live.json');      // the live version the bot saw last
 /** per thread: { title, forum, guild, owner, created, active, status: new|seen|none|asked|answered|staff|failed, replies,
  *  summary, category, snippet (its first post, for threads the bot only indexed), closed (archived, locked or deleted:
- *  not one to point people to); for a problem reported to the staff:
+ *  not one to point people to), tops (where its logs crash or freeze, sigs.mjs); for a problem reported to the staff:
  *  staffMsg, staffThread (the report and its thread), report (on the first one: what its post shows, REPORT below),
- *  reportOf (on the later ones: the first thread's id) } */
+ *  reportOf (on the later ones: the first thread's id); for a suggestion: votes ({ emoji: count } on its first post),
+ *  messages and members (Discord's counts for the thread; members stop at 50), counted (when) } */
 let threads = {};
 try { threads = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { /* first start */ }
 function save() {
@@ -112,6 +116,9 @@ function isStaff(member, channel) {
 }
 
 const translator = new Translator({ client, anthropic, state: CFG.state });   // Apps, Translate on a message
+// the FAQ (faq.mjs): /faq posts it; its text is faq.md in the clone, like system.md, so a push updates the posted message
+const faq = new Faq({ client, anthropic, state: CFG.state, readFile: rel => repo.file(rel),
+  read: async () => (await repo.file('discord-bot/faq.md')) || fs.readFileSync(path.join(HERE, 'faq.md'), 'utf8') });
 const tags = new Tags({ client, anthropic, isStaff, dryRun: CFG.dryRun, onSolved: solved });   // forum tags (tags.mjs)
 
 // the general channels (general.mjs): nudges to the forums, spikes and a daily digest for the staff
@@ -194,8 +201,9 @@ async function look(threadId, why, extra) {
   if (talk && st.replies >= CFG.maxTalk) return say(`skipped: ${st.replies} replies already, the most for answering replies`);
   if (!anyway && st.status === 'staff') return say('skipped: staff are in the thread');
   if (!anyway && st.replies >= CFG.maxReplies) return say(`skipped: ${st.replies} replies already`);
-  // staff asked: a look past the budget too.  Any other waits for the next day
-  if (!byStaff && !spend.allows()) {
+  // staff asked, or a release's notice (a few cents each, at most FIX_MAX + FEATURE_MAX a release): a look past the
+  // budget too.  Any other waits for the next day
+  if (!byStaff && !fix && !spend.allows()) {
     st.later = { why, ...(extra ? { extra } : {}), at: new Date().toISOString() }; save();
     return say(`skipped: today's $${spend.share().toFixed(2)} of the budget is spent, a look after midnight UTC`);
   }
@@ -223,12 +231,24 @@ async function look(threadId, why, extra) {
   // staff are waiting for this one: "typing…" in the thread until the reply is there (Discord shows it ~10 s a call)
   const typing = byStaff && setInterval(() => thread.sendTyping().catch(() => {}), 8000);
   if (typing) thread.sendTyping().catch(() => {});
-  let res;
-  try {
+  const tops = folderTops(workDir);
+  if (tops.length) st.tops = tops; else delete st.tops;
+  const context = { repo, guild: thread.guildId, thread: text, images, threads: recentThreads(threadId), reports: reportList(threadId),
+    places: placesOf(tops, threadId) };
+  let res = null, first = null;
+  // a new suggestion: a quick pass first (investigate.mjs firstPass), and a full look only when it sees something to say
+  if (why === 'new post' && SUGGESTIONS.test(st.forum ?? '')) {
+    first = await firstPass({ client: anthropic, ...context }).catch(e => { say(`first pass failed: ${e.message}`); return null; });
+    if (first) say(`first pass: ${first.verdict?.action ?? 'no verdict'}${first.cost != null ? ` ($${first.cost.toFixed(4)})` : ''}, ` +
+      `${first.quiet ? 'nothing to say, no full look' : 'a full look'}`);
+    if (first?.quiet) res = { verdict: first.verdict, turns: 1, cost: first.cost, usage: first.usage, log: ['first pass only'] };
+  }
+  if (!res) try {
     res = await investigate({
-      client: anthropic, model: CFG.model, effort: fix ? FIX_EFFORT : CFG.effort, maxTurns: fix ? FIX_TURNS : undefined, repo, archive, workDir,
-      thread: text, images, threads: recentThreads(threadId), reports: reportList(threadId), threadIndex: () => threadIndex(threadId), step: say,
+      client: anthropic, model: CFG.model, effort: fix ? FIX_EFFORT : CFG.effort, maxTurns: fix ? FIX_TURNS : undefined, ...context,
+      archive, workDir, threadIndex: () => threadIndex(threadId), step: say,
     });
+    if (first) res.cost = res.cost == null || first.cost == null ? null : res.cost + first.cost;
   } catch (e) {
     if (!byStaff) { clearInterval(typing); throw e; }
     res = { verdict: null, turns: 0, cost: 0, log: [`failed: ${e.message}`] };
@@ -865,10 +885,11 @@ async function checkRelease() {
 }
 
 /** the suggestion forums' threads, the archived ones too (the newest SUGGESTION_INDEX of each), into `threads` with
- *  their first posts and whether they are decided (Complete, Denied, locked): what a release may carry out */
-async function indexSuggestions() {
+ *  their first posts and whether they are decided (Complete, Denied, locked): what a release may carry out.  With
+ *  `votes`, every one's votes too (countVotes) */
+async function indexSuggestions(votes = false) {
   const forums = client.channels.cache.filter(ch => isForum(ch) && SUGGESTIONS.test(ch.name) && (!CFG.forums.length || CFG.forums.includes(ch.id)));
-  let fresh = 0;
+  let fresh = 0, counted = 0;
   for (const forum of forums.values()) {
     const found = [...(await forum.threads.fetchActive()).threads.values()];
     for (let before, more = true; more && found.length < SUGGESTION_INDEX;) {
@@ -881,13 +902,29 @@ async function indexSuggestions() {
       if (!threads[t.id]) fresh++;
       const st = threads[t.id] ??= { title: t.name, forum: forum.name, guild: forum.guildId, created: t.createdAt.toISOString(), status: 'seen', replies: 0 };
       Object.assign(st, { title: t.name, decided: t.locked || Tags.decided(t) });
+      if (votes) { counted += await countVotes(t, st); continue; }   // the first post comes with them
       if (st.snippet || st.summary) continue;
       const m = await t.fetchStarterMessage().catch(() => null);   // one at a time: discord.js waits out the rate limits
       if (m) st.snippet = m.content.replace(/\s+/g, ' ').slice(0, 200);
     }
   }
   save();
-  if (fresh) console.log(`[release] ${fresh} suggestion thread(s) read for the first time`);
+  if (fresh) console.log(`[${votes ? 'votes' : 'release'}] ${fresh} suggestion thread(s) read for the first time`);
+  if (votes) console.log(`[votes] ${counted} suggestion(s) counted`);
+}
+
+/** a suggestion's votes, for the developer (not the model): the reactions on its first post, and Discord's count of
+ *  its thread's messages and people.  The first post straight from the API: discord.js's cached copy keeps reactions
+ *  that are gone (the bot has no reactions intent, and a post without reactions comes without the field).  1 if read */
+async function countVotes(t, st) {
+  const m = await client.rest.get(Routes.channelMessage(t.id, t.id)).catch(() => null);   // a forum post's id is its first post's
+  st.messages = t.messageCount ?? st.messages;
+  st.members = t.memberCount ?? st.members;
+  if (!m) return 0;                                // the first post was deleted
+  st.votes = Object.fromEntries((m.reactions ?? []).map(r => [r.emoji.name ?? r.emoji.id, r.count]));
+  if (!st.snippet && !st.summary) st.snippet = (m.content ?? '').replace(/\s+/g, ' ').slice(0, 200);
+  st.counted = new Date().toISOString();
+  return 1;
 }
 
 async function download(url) {
@@ -897,27 +934,48 @@ async function download(url) {
   } catch { return null; }
 }
 
-/** one known thread as the model sees it; its summary cut to `max` characters */
-function threadLine([id, t], max = Infinity) {
+/** one known thread as the model sees it; its summary cut to `max` characters; with link false, without its link (the
+ *  context of a look gives the pattern once: ~20 tokens a line less) */
+function threadLine([id, t], max = Infinity, link = true) {
   const what = (t.summary || (t.snippet ? `first post: ${t.snippet}` : '')).slice(0, max);
-  return `- ${id} https://discord.com/channels/${t.guild}/${id} #${t.forum}, ${(t.active ?? t.created).slice(0, 10)} ` +
+  return `- ${id}${link ? ` https://discord.com/channels/${t.guild}/${id}` : ''} #${t.forum}, ${(t.active ?? t.created).slice(0, 10)} ` +
     `[${[t.category, t.status, t.staffMsg && 'developer told'].filter(Boolean).join(', ')}] ${t.title}${what ? `: ${what}` : ''}`;
 }
 const byActivity = (a, b) => (b[1].active ?? b[1].created).localeCompare(a[1].active ?? a[1].created);
 /** the threads active last, for the context */
 function recentThreads(except) {
-  return Object.entries(threads).filter(([id]) => id !== except).sort(byActivity).slice(0, 30).map(e => threadLine(e, 160)).join('\n');
+  return Object.entries(threads).filter(([id]) => id !== except).sort(byActivity).slice(0, 30).map(e => threadLine(e, 160, false)).join('\n');
 }
 /** the problems the developer has a report on (the staff channel), the latest change first: the report's first
  *  thread, where it stands, how many threads, its title.  What a look points a poster to and joins a thread to */
 function reportList(except) {
+  const tops = reportTops(except);
   return Object.entries(threads).filter(([id, t]) => t.staffMsg && !t.reportOf && id !== except).map(([id, t]) => {
     const r = t.report, at = r?.log.at(-1)?.[0] ?? Date.parse(t.active ?? t.created) / 1000;
     const where = !r ? 'open' : r.again ? 'reported again after a fix or a "works now"'
       : r.fix ? `${r.fix.added ? 'added' : 'fixed'} by ${r.fix.commit}, live` : r.confirmed ? 'solved, the poster says' : 'open';
-    return { at, line: `- ${id} https://discord.com/channels/${t.guild}/${id} [${where}, ${r?.threads.length ?? 1} thread(s), ` +
-      `last change ${new Date(at * 1000).toISOString().slice(0, 10)}] ${(r?.title ?? t.summary ?? t.title).slice(0, 150)}` };
+    const logs = tops[id]?.length ? ` (logs: ${tops[id].slice(-2).join('; ')})` : '';
+    return { at, line: `- ${id} [${where}, ${r?.threads.length ?? 1} thread(s), ` +
+      `last change ${new Date(at * 1000).toISOString().slice(0, 10)}] ${(r?.title ?? t.summary ?? t.title).slice(0, 150)}${logs}` };
   }).sort((a, b) => b.at - a.at).slice(0, 25).map(x => x.line).join('\n');
+}
+/** each report's (its first thread's id) stack tops: those of its threads' logs, but the thread `except`'s */
+function reportTops(except) {
+  const m = {};
+  for (const [id, t] of Object.entries(threads)) {
+    if (id === except || !t.staffMsg || !t.tops) continue;
+    const list = m[t.reportOf ?? id] ??= [];
+    for (const s of t.tops) if (!list.includes(s)) list.push(s);
+  }
+  return m;
+}
+/** for a look: where this thread's logs crash or freeze, and the reports whose logs stop in the same place */
+function placesOf(tops, threadId) {
+  if (!tops.length) return '';
+  const same = Object.entries(reportTops(threadId)).filter(([id, ts]) => threads[id]?.staffMsg && !threads[id].reportOf &&
+    ts.some(a => tops.some(b => samePlace(a, b)))).map(([id]) => id);
+  return `Where this thread's logs crash or freeze (the functions at the top of the stack): ${tops.join('; ')}\n` +
+    `Reports whose logs stop in the same place: ${same.length ? same.slice(0, 5).join(', ') : 'none'}`;
 }
 /** every known thread, for the search_threads tool: [{ line, text }] */
 function threadIndex(except) {
@@ -971,11 +1029,17 @@ client.on(Events.ClientReady, c => {
   repo.sync(true).catch(e => console.error(`[repo] ${e.message}`));
   // the staff channel's messages saved before they were marked, by its name
   if (archive && CFG.staffChannel) c.channels.fetch(CFG.staffChannel).then(ch => { archive.staffName = ch?.name; }).catch(() => {});
-  c.application.commands.set([TRANSLATE]).catch(e => console.error(`[translate] the command: ${e.message}`));
+  c.application.commands.set([TRANSLATE, FAQ]).catch(e => console.error(`[bot] the commands: ${e.message}`));
   let checking = null;                           // one check at a time: the first one reads every suggestion
   const release = () => checking ??= checkRelease().catch(e => console.error(`[release] ${e.message}`)).finally(() => { checking = null; });
-  indexForums().catch(e => console.error(`[bot] forum index: ${e.message}`)).finally(release);
+  let counting = null;                           // the suggestions' votes, one count at a time
+  const votes = () => counting ??= indexSuggestions(true).catch(e => console.error(`[votes] ${e.message}`)).finally(() => { counting = null; });
+  indexForums().catch(e => console.error(`[bot] forum index: ${e.message}`)).finally(() => { release(); votes(); });
   setInterval(release, RELEASE_CHECK_MS);
+  // faq.md pushed: the posted FAQ follows (the clone is fetched at most every 5 minutes)
+  const faqs = () => repo.sync().then(() => faq.refresh()).catch(e => console.error(`[faq] ${e.message}`));
+  faqs(); setInterval(faqs, RELEASE_CHECK_MS);
+  setInterval(votes, VOTES_MS);
   setInterval(() => general.tick().catch(e => console.error(`[general] ${e.message}`)), 60_000);
   // posts that came in shortly before a restart still get their look
   for (const [id, t] of Object.entries(threads)) if (t.status === 'new' && Date.now() - Date.parse(t.created) < STARTUP_MS) schedule(id, 'new post');
@@ -1013,7 +1077,7 @@ client.on(Events.MessageCreate, guard('message', m => {
       author: m.member?.displayName ?? m.author.username, text: m.content.slice(0, 4000), files: [...m.attachments.values()].map(a => a.name),
       // the staff channel and its reports' threads: a look may learn from them, never repeat them
       ...(CFG.staffChannel && (m.channelId === CFG.staffChannel || m.channel.parentId === CFG.staffChannel) ? { staff: true } : {}),
-    });
+    }, [...m.attachments.values()].map(a => ({ url: a.url, name: a.name, size: a.size, type: a.contentType })));
   }
   const thread = m.channel;
   // staff mentioning the bot in the staff channel: their answer, for every thread of a report
@@ -1067,6 +1131,10 @@ client.on(Events.MessageCreate, guard('message', m => {
 client.on(Events.InteractionCreate, i => {
   if (i.isMessageContextMenuCommand() && i.commandName === TRANSLATE.name) {
     translator.handle(i).catch(e => console.error(`[translate] ${i.targetId}: ${e.stack || e}`));
+  } else if (i.isChatInputCommand() && i.commandName === FAQ.name) {
+    faq.command(i).catch(e => console.error(`[faq] /faq: ${e.stack || e}`));
+  } else if (i.isButton() && i.customId.startsWith(FAQ_BUTTON)) {
+    faq.click(i).catch(e => console.error(`[faq] ${i.customId}: ${e.stack || e}`));
   }
 });
 client.on(Events.Error, e => console.error(`[bot] discord: ${e.message}`));

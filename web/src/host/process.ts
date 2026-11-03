@@ -3,6 +3,7 @@
 import { CTL_EXIT, CTL_INTS, CTL_NEXT_TID, CTL_POOL, MAX_THREADS, POOL_IDLE, POOL_NONE, POOL_RUN_MAIN, RPC_BYTES, type BootConfig, type ToPage } from './proto';
 import { tzEnv } from './tz';
 import { movieCodec } from './movie';
+import { allocMemory, memoryTries } from './memory';
 
 export interface ProcessOptions {
   module: WebAssembly.Module;
@@ -17,6 +18,13 @@ export interface ProcessOptions {
   onSaved?: (path: string) => void;
   /** a line of the host's own for the log, from no game thread (the I/O worker's "[data] ...") */
   onNote?: (s: string) => void;
+  /** the browser deleted the save folder during the game, and the I/O worker made an empty one: the saves back into
+   *  it, before the game's next save there (the I/O worker holds every save call until this resolves, 12 s at most) */
+  onSaveGone?: () => Promise<void>;
+  /** the game deleted a file of the save overlay: a profile's (its own Delete), path relative to /save */
+  onRemoved?: (path: string) => void;
+  /** a file the game wrote as the browser deleted the save folder could not be kept (path relative to /save) */
+  onLost?: (path: string) => void;
 }
 
 export interface GameProcess {
@@ -49,7 +57,12 @@ export async function startProcess(o: ProcessOptions): Promise<GameProcess> {
   // which movies the I/O worker opens (the page decides before the game starts: shell.ts; a test page here)
   cfg.env.NFSU2_MOVIE_CODEC = await movieCodec(cfg.env);
   const initial = o.initialPages ?? memoryPagesOf(o.module) ?? 16384;
-  const memory = new WebAssembly.Memory({ initial, maximum: 65536, shared: true });
+  // the build's size, able to grow to 4 GB, or not growing where the browser refuses that (memory.ts); the log says which
+  let got: ReturnType<typeof allocMemory>;
+  try { got = allocMemory(memoryTries(initial)); }
+  catch (e) { const n = (e as { note?: string } | null)?.note; if (n) o.onNote?.(n); throw e; }
+  const { memory, note } = got;
+  o.onNote?.(note);
   const ctlBuf = new SharedArrayBuffer(CTL_INTS * 4), rpc = new SharedArrayBuffer(RPC_BYTES);
   const ctl = new Int32Array(ctlBuf);
   ctl[CTL_NEXT_TID] = 1;
@@ -82,7 +95,15 @@ export async function startProcess(o: ProcessOptions): Promise<GameProcess> {
     io.onmessage = (e) => { if (e.data.t === 'io-ready') res(); else if (e.data.t === 'io-error') rej(new Error(e.data.msg)); };
     io.postMessage({ memory, ctl: ctlBuf, rpc, cfg });
   });
-  io.onmessage = (e) => { if (e.data.t === 'saved') o.onSaved?.(e.data.path); else if (e.data.t === 'log') o.onNote?.(e.data.s); };
+  io.onmessage = (e) => {
+    if (e.data.t === 'saved') o.onSaved?.(e.data.path);
+    else if (e.data.t === 'removed') o.onRemoved?.(e.data.path);
+    else if (e.data.t === 'lost') o.onLost?.(e.data.path);
+    else if (e.data.t === 'log') o.onNote?.(e.data.s);
+    else if (e.data.t === 'save-gone')
+      void Promise.resolve().then(() => o.onSaveGone?.()).catch(err => o.onNote?.(`[app] the saves could not be put back: ${err}`))
+        .finally(() => io.postMessage({ t: 'save-ready' }));
+  };
 
   for (let s = 0; s < pool; s++) ctl[CTL_POOL + 4 * s] = POOL_NONE;   // each worker makes its slot idle when ready
   let started = 0, starting = 0, mostBusy = 0;

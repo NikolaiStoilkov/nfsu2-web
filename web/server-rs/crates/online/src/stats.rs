@@ -7,7 +7,9 @@
 //! A race counts once: the first result report (rank, RESU) from one of its players that passes the checks in
 //! lobby.rs; the others' reports are only compared with it.  Rating points per race: (players - place) * 100 /
 //! (players - 1), so the winner gets 100 and the last 0, ranked races only.  Every count is kept twice: overall and
-//! for the current month (the month's counts start again when it changes, as the game's monthly rankings did).  A
+//! for the current month (the month's counts start again when it changes, as the game's monthly rankings did), and
+//! the month before's counts stay as they were when it ended (the Monthly Point Leaders' Last Month's Leaderboard,
+//! from November 2026 on: `FIRST_WHOLE_MONTH`).  A
 //! persona's records come from its own entry in its own reports (`add_records`: what another player's game saw of it
 //! is a guess).  Personas not seen for `prune_months` months are forgotten; with MAX_PERSONAS of them, the least
 //! recently seen goes for a new one (the Online audit's ONL-7: a full store refused every new player), and a persona
@@ -16,9 +18,9 @@
 //! Messenger's search).
 //!
 //! Written atomically (a temporary file, then rename), at most every `save_ms` and when the server stops, byte for
-//! byte as the Node server it replaced wrote it, but for a persona's records ("rec", only once it has one; the file
-//! that server left is read as it is).  A file that does not parse is kept aside (stats.json.bad-<time>) and the
-//! server starts with no results.
+//! byte as the Node server it replaced wrote it, but for a persona's records ("rec", only once it has one) and last
+//! month's counts ("last", only once it has some; the file that server left is read as it is).  A file that does not
+//! parse is kept aside (stats.json.bad-<time>) and the server starts with no results.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,6 +44,12 @@ const MAX_BEST: usize = 300;
 /// the largest figure a record takes (a report's figure past it is no car's): top speed in m/s (540 km/h), drift
 /// points, powerslide in m, jump in s
 const RECORD_MAX: [f64; 4] = [150.0, 100_000_000.0, 10_000.0, 60.0];
+/// The first month whose counts are kept whole until it ends, so the first one Last Month's Leaderboard shows (from
+/// 1 December 2026).  The server before (until 2026-11) cleared a month's counts when the next one began: every
+/// persona it saw from 1 November 2026 on lost its October, and only those not back since keep theirs, so a board of
+/// October 2026 would name the wrong leaders.  A record's counts of a month before it stay in the file as they are,
+/// shown nowhere (`last_shown`).
+const FIRST_WHOLE_MONTH: &str = "2026-11";
 
 /// one race type's counts (f64: a hand-edited file's numbers are kept, fractions too, from 0 to 2^31)
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -70,8 +78,9 @@ pub struct Records {
     pub drag: f64,
 }
 
-/// a persona's record: its name, the month it was last seen, its counts overall (all) and for the month, its best
-/// times ("type:track" -> seconds), its records
+/// a persona's record: its name, the month it was last seen, its counts overall (all), for the month and for the
+/// month before it (last: what that month's counts were when it ended; last_key "" for none), its best times
+/// ("type:track" -> seconds), its records
 #[derive(Clone, Debug)]
 pub struct Record {
     pub name: String,
@@ -79,16 +88,29 @@ pub struct Record {
     pub all: Table,
     pub month_key: String,
     pub month: Table,
+    pub last_key: String,
+    pub last: Table,
     pub best: IndexMap<String, f64>,
     pub records: Records,
 }
 
-/// a player of a race: place 1..n, 0 = did not finish; time in seconds
+/// which counts a ranking goes by: overall, the current month's (Current Month's Leaderboard) or the month before's
+/// (Last Month's Leaderboard)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Period {
+    All,
+    Month,
+    LastMonth,
+}
+
+/// a player of a race: place 1..n, 0 = did not finish; time in seconds; left: it did not finish because it left the
+/// race (a disconnect in its career), not because the race ended with it on the way
 #[derive(Clone, Debug)]
 pub struct RacePlayer {
     pub name: String,
     pub place: u32,
     pub time: f64,
+    pub left: bool,
 }
 
 /// one race's result: type (0..5, RACE_TYPES), ranked, track, the players in finishing order
@@ -153,8 +175,8 @@ pub struct Stats {
     board_ms: f64,
     /// lower-case name -> record, the least recently seen first
     p: OrderedMap<String, Record>,
-    /// (race type, monthly) -> the ranking as last built
-    boards: HashMap<(u32, bool), Ranking>,
+    /// (race type, period) -> the ranking as last built
+    boards: HashMap<(u32, Period), Ranking>,
     /// the names sorted by their lower case (EA Messenger's search), and when
     sorted: Option<Sorted>,
     dirty: bool,
@@ -250,6 +272,8 @@ impl Stats {
                 all: Default::default(),
                 month_key: m,
                 month: Default::default(),
+                last_key: String::new(),
+                last: Default::default(),
                 best: IndexMap::new(),
                 records: Records::default(),
             };
@@ -300,8 +324,8 @@ impl Stats {
                     (false, true) => c.uw += 1.0,
                     (false, false) => c.ul += 1.0,
                 }
-                // dropped out of the race
-                if pl.place == 0 {
+                // left the race (a racer still on the way when it ended did not finish either, and stayed)
+                if pl.place == 0 && pl.left {
                     c.dc += 1.0;
                 }
             }
@@ -380,14 +404,19 @@ impl Stats {
     }
 
     /// a ranking: best first (points, then wins, then fewer losses, then name)
-    pub fn board(&mut self, kind: u32, monthly: bool) -> Vec<BoardRow> {
+    pub fn board(&mut self, kind: u32, period: Period) -> Vec<BoardRow> {
         self.builds += 1;
         let m = jsx::month_of(self.now());
         let mut rows = Vec::new();
         let t = kind as usize;
         self.p.for_each_mut(|_, r| {
             roll(r, &m);
-            let table = if monthly { &r.month } else { &r.all };
+            let table = match period {
+                Period::All => &r.all,
+                Period::Month => &r.month,
+                Period::LastMonth if last_shown(r) => &r.last,
+                Period::LastMonth => return,
+            };
             let Some(c) = table.get(t).copied().flatten() else { return };
             if c.races == 0.0 {
                 return;
@@ -407,19 +436,19 @@ impl Stats {
 
     /// a ranking as the game's Rankings ask for it: the board with each row's rank, and the rows by name; built at
     /// most every board_ms (a race's result shows within that)
-    pub fn ranking(&mut self, kind: u32, monthly: bool) -> &Ranking {
+    pub fn ranking(&mut self, kind: u32, period: Period) -> &Ranking {
         let now = self.now();
         let month = jsx::month_of(now);
-        let fresh = self.boards.get(&(kind, monthly)).is_some_and(|b| now - b.t < self.board_ms && b.month == month);
+        let fresh = self.boards.get(&(kind, period)).is_some_and(|b| now - b.t < self.board_ms && b.month == month);
         if !fresh {
-            let mut rows = self.board(kind, monthly);
+            let mut rows = self.board(kind, period);
             for (i, r) in rows.iter_mut().enumerate() {
                 r.rank = i + 1;
             }
             let index = rows.iter().enumerate().map(|(i, r)| (r.name.to_lowercase(), i)).collect();
-            self.boards.insert((kind, monthly), Ranking { t: now, month, rows, index });
+            self.boards.insert((kind, period), Ranking { t: now, month, rows, index });
         }
-        &self.boards[&(kind, monthly)]
+        &self.boards[&(kind, period)]
     }
 
     /// at most max names that begin with prefix (lower case), from a sorted list built at most every board_ms
@@ -499,7 +528,16 @@ impl Stats {
             json::write_str(&mut s, &r.month_key);
             s.push_str(",\"t\":");
             write_table(&mut s, &r.month);
-            s.push_str("},\"best\":{");
+            s.push('}');
+            // last month's counts (only once it has some)
+            if !r.last_key.is_empty() && r.last.iter().any(Option::is_some) {
+                s.push_str(",\"last\":{\"key\":");
+                json::write_str(&mut s, &r.last_key);
+                s.push_str(",\"t\":");
+                write_table(&mut s, &r.last);
+                s.push('}');
+            }
+            s.push_str(",\"best\":{");
             for (j, (k, v)) in r.best.iter().enumerate() {
                 if j > 0 {
                     s.push(',');
@@ -551,12 +589,33 @@ impl Stats {
     }
 }
 
-/// a new month: the monthly counts start again
+/// a new month: the monthly counts start again; those of the month that ended are last month's when it was the one
+/// before (a persona that did not race in it has none)
 fn roll(r: &mut Record, m: &str) {
     if r.month_key != m {
+        let before = month_before(m);
+        if r.month_key == before {
+            r.last_key = std::mem::take(&mut r.month_key);
+            r.last = std::mem::take(&mut r.month);
+        } else if r.last_key != before {
+            r.last_key = String::new();
+            r.last = Default::default();
+        }
         r.month_key = m.to_string();
         r.month = Default::default();
     }
+}
+
+/// a record's last month's counts show (Last Month's Leaderboard): those of FIRST_WHOLE_MONTH or later
+fn last_shown(r: &Record) -> bool {
+    !r.last_key.is_empty() && month_parts(&r.last_key) >= month_parts(FIRST_WHOLE_MONTH)
+}
+
+/// the month before a month ("2026-01" -> "2025-12")
+fn month_before(m: &str) -> String {
+    let (y, mo) = month_parts(m);
+    let n = y * 12 + mo - 2;
+    format!("{}-{:02}", n.div_euclid(12), n.rem_euclid(12) + 1)
 }
 
 /// `s.split('-').map(Number)` of a month that passed its check ("2026-10")
@@ -664,6 +723,9 @@ fn clean(r: &Value, name: &str) -> Record {
     let month = r.get("month");
     let key = month_str(month.and_then(|m| if m.is_object() { m.get("key") } else { None })).unwrap_or_else(|| seen.clone());
     let mt = month.and_then(|m| if m.is_object() { m.get("t") } else { None });
+    let last = r.get("last").filter(|l| l.is_object());
+    let last_key = month_str(last.and_then(|l| l.get("key"))).unwrap_or_default();
+    let last_t = if last_key.is_empty() { Default::default() } else { counts(last.and_then(|l| l.get("t"))) };
     let all = counts(r.get("all").filter(|_| r.is_object()));
     let mut rec = Records::default();
     if let Some(Value::Object(o)) = r.get("rec") {
@@ -680,7 +742,7 @@ fn clean(r: &Value, name: &str) -> Record {
             drag: take("drag", 1e9),
         };
     }
-    Record { name: name.to_string(), seen, all, month_key: key, month: counts(mt), best, records: rec }
+    Record { name: name.to_string(), seen, all, month_key: key, month: counts(mt), last_key, last: last_t, best, records: rec }
 }
 
 /// a record's figures by their names in the file
@@ -725,6 +787,9 @@ pub struct RaceReport {
 pub struct ReportPlayer {
     pub index: u8,
     pub place: u8,
+    /// how the racer's race ended, as the reporter's game has it (the race coordinator's racer +0x10, SPEED2.EXE
+    /// 0x515e28): 1 finished, `OUT` put out on the road, 0x0c gone from this game's race
+    pub state: u8,
     pub car: u8,
     pub time: f64,
     pub score: i32,
@@ -735,6 +800,27 @@ pub struct ReportPlayer {
     pub jump: f64,
     pub slide: f64,
     pub drift_best: i32,
+}
+
+/// A racer's state (`ReportPlayer::state`) when the race put it out on the road: still on the way when the race
+/// ended, 30 s after the first finisher (its place where this game saw it on the road then, its time the race clock
+/// then: the same in every game of a test race, 2026-11-02), or a car that never moved from the start, after about
+/// 30 s.  Every game, its own included, reports it so.  (A racer gone from a game's race is 0x0c there; a game that
+/// left the race reports every racer so.)
+pub const OUT: u8 = 0x0b;
+
+impl ReportPlayer {
+    /// a racer who crossed the finish line, in the reporter's game: its place is the order the racers finished in,
+    /// the same in every game (the others' places do not decide a result: lobby.rs `rank`)
+    pub fn finished(&self) -> bool {
+        !self.dropped
+    }
+
+    /// the reporter's own entry: it raced to the end, finished or put out on the road when the race ended (`OUT`),
+    /// and its game saw the finishers cross the line
+    pub fn raced_to_the_end(&self) -> bool {
+        !self.dropped || self.state == OUT
+    }
 }
 
 /// a race report from its base64 (rank RESU): None for anything that does not parse
@@ -764,6 +850,7 @@ pub fn decode_result(b64: &str) -> Option<RaceReport> {
         players.push(ReportPlayer {
             index: b[o],
             place: b[o + 1],
+            state: b[o + 2],
             car: b[o + 3],
             time: finite(time),
             score: i32_at(o + 44),
@@ -824,7 +911,7 @@ pub(crate) mod tests {
             kind,
             ranked,
             track,
-            players: players.iter().map(|(n, p, t)| RacePlayer { name: n.to_string(), place: *p, time: *t }).collect(),
+            players: players.iter().map(|(n, p, t)| RacePlayer { name: n.to_string(), place: *p, time: *t, left: *p == 0 }).collect(),
         }
     }
 
@@ -841,7 +928,7 @@ pub(crate) mod tests {
         let mut st = Stats::new(StatsOptions::new(None, clocks(t.clone()), quiet()));
         st.add_race(&race(0, true, 4014, &[("Alpha", 1, 100.0), ("Bravo", 2, 101.0), ("Charlie", 0, 0.0)]));
         st.add_race(&race(0, false, 4014, &[("Bravo", 1, 99.5), ("Alpha", 2, 102.0)]));
-        let b = st.board(0, false);
+        let b = st.board(0, Period::All);
         let got: Vec<(String, f64, f64, f64, f64)> = b.iter().map(|r| (r.name.clone(), r.points, r.wins, r.losses, r.races)).collect();
         assert_eq!(
             got,
@@ -859,13 +946,95 @@ pub(crate) mod tests {
         assert_eq!(hexes(&stat)[8..13], [100, 1, 0, 0, 1]);
         assert_eq!(st.rec("Bravo", false).unwrap().best["0:4014"], 99.5);
         assert_eq!(st.stat_field(Some("nobody"), false), "0,".repeat(38));
-        // a new month: the monthly counts start again, the overall ones stay
+        assert_eq!(st.board(0, Period::LastMonth).len(), 0, "no month before kept yet");
+        // a new month: the monthly counts start again, the overall ones stay, the month that ended is kept as last
+        // month's, but October 2026 shows nowhere (FIRST_WHOLE_MONTH: the server before kept no month whole)
         t.set(1_793_577_600_000.0); // Date.UTC(2026, 10, 2)
-        assert_eq!(st.board(0, true).len(), 0);
-        assert_eq!(st.board(0, false).len(), 3);
+        assert_eq!(st.board(0, Period::Month).len(), 0);
+        assert_eq!(st.board(0, Period::All).len(), 3);
+        assert!(st.board(0, Period::LastMonth).is_empty(), "October 2026: not shown");
+        let alpha = st.rec("Alpha", false).unwrap();
+        assert_eq!((alpha.last_key.as_str(), alpha.last[0].map(|c| c.points)), ("2026-10", Some(100.0)), "but kept");
         assert_eq!(st.stat_field(Some("Alpha"), true), "0,".repeat(38));
         st.add_race(&race(1, false, 1, &[("Alpha", 1, 50.0), ("Bravo", 2, 51.0)]));
-        assert_eq!(st.board(1, true)[0].name, "Alpha");
+        assert_eq!(st.board(1, Period::Month)[0].name, "Alpha");
+        assert_eq!(st.board(1, Period::LastMonth).len(), 0, "this month's race is not last month's");
+        // the month after: November's counts are last month's (the first month shown), October's are gone; a persona
+        // that did not race in November has none
+        t.set(1_796_169_600_000.0); // Date.UTC(2026, 11, 2)
+        let last: Vec<String> = st.board(1, Period::LastMonth).iter().map(|r| r.name.clone()).collect();
+        assert_eq!(last, ["Alpha", "Bravo"]);
+        assert!(st.board(0, Period::LastMonth).is_empty());
+        assert!(st.rec("Charlie", false).unwrap().last.iter().all(Option::is_none));
+        // a month with no race at all in between: nothing is last month's
+        t.set(1_801_440_000_000.0); // Date.UTC(2027, 1, 1)
+        assert!((0..6).all(|k| st.board(k, Period::LastMonth).is_empty()));
+    }
+
+    // last month's counts: written once there are some, read back, kept over a new year; a file without them (as the
+    // Node server and the server before 2026-11 wrote it) is read as before
+    #[test]
+    fn last_month_saved_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_path_buf();
+        let t = Rc::new(Cell::new(1_796_083_200_000.0)); // Date.UTC(2026, 11, 1): December
+        let opts = || StatsOptions::new(Some(d.clone()), clocks(t.clone()), quiet());
+        let mut a = Stats::new(opts());
+        a.add_race(&race(0, true, 7, &[("Alpha", 1, 100.0), ("Bravo", 2, 101.0), ("Charlie", 3, 102.0)]));
+        a.stop();
+        let text = std::fs::read_to_string(d.join("stats.json")).unwrap();
+        assert!(!text.contains("\"last\""), "none yet: the file as before");
+        t.set(1_798_761_600_000.0); // Date.UTC(2027, 0, 1): a new year
+        let mut b = Stats::new(opts());
+        assert_eq!(b.board(0, Period::LastMonth).len(), 3);
+        b.add_race(&race(1, false, 7, &[("Alpha", 1, 50.0), ("Bravo", 2, 51.0)]));
+        b.stop();
+        let text = std::fs::read_to_string(d.join("stats.json")).unwrap();
+        assert!(
+            text.contains(
+                r#""month":{"key":"2027-01","t":{"1":{"races":1,"rw":0,"rl":0,"uw":1,"ul":0,"points":0,"dc":0}}},"last":{"key":"2026-12","t":{"0":{"races":1,"rw":1,"rl":0,"uw":0,"ul":0,"points":100,"dc":0}}},"best""#
+            ),
+            "{text}"
+        );
+        let mut c = Stats::new(opts());
+        let got: Vec<(String, f64)> = c.board(0, Period::LastMonth).iter().map(|r| (r.name.clone(), r.points)).collect();
+        assert_eq!(got, [("Alpha".to_string(), 100.0), ("Bravo".to_string(), 50.0), ("Charlie".to_string(), 0.0)]);
+        // a hand-edited "last": a key that is no month counts as none
+        std::fs::write(
+            d.join("stats.json"),
+            r#"{"personas":[{"name":"Okay","seen":"2027-01","all":{},"month":{"key":"2027-01","t":{}},"last":{"key":"x","t":{"0":{"races":1}}}}]}"#,
+        )
+        .unwrap();
+        let mut e = Stats::new(opts());
+        assert!(e.board(0, Period::LastMonth).is_empty());
+    }
+
+    // the file the server before left in November 2026: it cleared October for every persona it saw since 1 November
+    // ("Back"), and only one not back since still has it ("Gone").  October shows nowhere, so Gone does not lead a
+    // board of one; its counts stay in the file.  From December, November's leaders show
+    #[test]
+    fn last_month_before_november_2026_not_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_path_buf();
+        std::fs::write(
+            d.join("stats.json"),
+            r#"{"v":1,"personas":[
+                {"name":"Gone","seen":"2026-10","all":{"0":{"races":5,"rw":4,"points":400}},"month":{"key":"2026-10","t":{"0":{"races":5,"rw":4,"points":400}}},"best":{}},
+                {"name":"Back","seen":"2026-11","all":{"0":{"races":9,"rw":9,"points":900}},"month":{"key":"2026-11","t":{"0":{"races":1,"rw":1,"points":100}}},"best":{}}
+            ]}"#,
+        )
+        .unwrap();
+        let t = Rc::new(Cell::new(1_793_577_600_000.0)); // Date.UTC(2026, 10, 2)
+        let mut st = Stats::new(StatsOptions::new(Some(d.clone()), clocks(t.clone()), quiet()));
+        assert!(st.board(0, Period::LastMonth).is_empty(), "October 2026: not shown");
+        assert!(st.ranking(0, Period::LastMonth).rows.is_empty());
+        assert!(
+            st.serialize().contains(r#""last":{"key":"2026-10","t":{"0":{"races":5,"rw":4,"rl":0,"uw":0,"ul":0,"points":400,"dc":0}}}"#),
+            "kept in the file"
+        );
+        t.set(1_796_169_600_000.0); // Date.UTC(2026, 11, 2)
+        let got: Vec<(String, f64)> = st.board(0, Period::LastMonth).iter().map(|r| (r.name.clone(), r.points)).collect();
+        assert_eq!(got, [("Back".to_string(), 100.0)], "November's leaders");
     }
 
     // saved atomically with public fields only, read back, a damaged file kept aside, pruned
@@ -893,7 +1062,7 @@ pub(crate) mod tests {
             !text.contains("10.77.") && !text.contains("PASS") && !text.contains("MID") && !text.contains("ADDR") && !text.contains('@')
         );
         let mut b = Stats::new(opts(quiet()));
-        let got: Vec<(String, f64)> = b.board(2, false).iter().map(|r| (r.name.clone(), r.points)).collect();
+        let got: Vec<(String, f64)> = b.board(2, Period::All).iter().map(|r| (r.name.clone(), r.points)).collect();
         assert_eq!(got, [("Alpha".to_string(), 100.0), ("Bravo".to_string(), 0.0)]);
         // a hand-edited file: unknown fields and bad numbers are dropped
         std::fs::write(
@@ -909,7 +1078,7 @@ pub(crate) mod tests {
         let logs = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
         let l2 = logs.clone();
         let mut e = Stats::new(opts(Rc::new(move |s: &str, _: Option<&str>| l2.borrow_mut().push(s.to_string()))));
-        assert_eq!(e.board(0, false).len(), 0);
+        assert_eq!(e.board(0, Period::All).len(), 0);
         assert!(std::fs::read_dir(&d).unwrap().any(|f| f.unwrap().file_name().to_string_lossy().starts_with("stats.json.bad-")));
         assert!(logs.borrow().iter().any(|l| l.contains("could not be read")));
         // personas not seen for a year are forgotten at the next save
@@ -1001,6 +1170,7 @@ pub(crate) mod tests {
         let me = |time, top, jump, slide, drift_best| ReportPlayer {
             index: 0,
             place: 1,
+            state: 1,
             car: 0,
             time,
             score: 0,
@@ -1087,18 +1257,15 @@ pub(crate) mod tests {
             .spawn(move || {
                 let st = Stats::new(StatsOptions::new(Some(d.clone()), clocks(Rc::new(Cell::new(T0))), quiet()));
                 let alpha = st.p.get("alpha").map(|r| (r.all[0], r.all[1].is_some()));
-                let b = crate::buddy::Buddies::new(Some(d.clone()), Default::default());
+                let _ = crate::buddy::Buddies::new(Some(d.clone()), Default::default());
                 let bad = Stats::new(StatsOptions::new(Some(bad), clocks(Rc::new(Cell::new(T0))), quiet()));
-                (alpha, b.serialize(), bad.p.len())
+                (alpha, crate::buddy::shelf_texts(&d), bad.p.len())
             })
             .unwrap();
         let (alpha, buddies, bad) = t.join().expect("read on the online host's stack");
         // (the array in "1" is a count block of none of the fields, as `clean` makes it)
         assert_eq!(alpha, Some((Some(Counts { races: 2.0, rw: 1.0, ..Default::default() }), true)));
-        assert_eq!(
-            buddies,
-            r#"{"v":3,"note":"NFSU2 online Messenger lists (persona names; friend requests and messages waiting for their persona)","personas":[{"name":"Alpha","seen":"2026-10","B":["Bravo"]}]}"#
-        );
+        assert_eq!(buddies, [r#"{"v":4,"name":"Alpha","seen":"2026-10","B":["Bravo"]}"#]);
         assert_eq!(bad, 0);
     }
 

@@ -14,7 +14,7 @@ import { StatusReader } from './status';
 import { DATA_BASE, MANIFEST_URL } from '../host/datacache';
 import type { GameInfo } from './loader';
 import type { PadPage } from '../input/gamepad';
-import type { NetQueue, NetRemoved } from '../net';
+import type { NetQueue, NetRaces, NetRemoved, NetRename } from '../net';
 
 export interface SessionOptions {
   module: WebAssembly.Module;
@@ -33,6 +33,12 @@ export interface SessionOptions {
   lobby?(json: string): void;
   /** free roam: quick chat, a phrase said (by a friend or the player), as JSON from the game */
   say?(json: string): void;
+  /** free roam: front bumpers touching for 3 s, or parted, as JSON from the game (friends.ts) */
+  bump?(json: string): void;
+  /** free roam: a drift battle's scoreboard, as JSON from the game ("{}": none; drift.ts) */
+  battle?(json: string): void;
+  /** free roam: a friend message from the server (friends.ts) */
+  friend?(m: Record<string, unknown>): void;
   /** every frame drawn: quick chat's places over the cars in it (contract.ts RendererOptions.onMarks) */
   marks?(n: number, m: Float32Array, ids: Uint32Array): void;
   /** the server's LAN took the game back after the link was lost (a server restart, as for a deploy) */
@@ -48,8 +54,18 @@ export interface SessionOptions {
   netBlock?: string[];
   /** the server's operator removed the player from playing with others (a kick or a ban) */
   netRemoved?(r: NetRemoved): void;
+  /** the operator's race ban: the player plays on with others but races none of them (null: lifted) */
+  netRaces?(r: NetRaces | null): void;
+  /** the operator took the player's name away: the page asks for another */
+  netRename?(r: NetRename): void;
   /** the game finished writing a file of the save overlay (path relative to /save) */
   onSaved?(path: string): void;
+  /** the browser deleted the save folder during the game: the saves back into the new one (process.ts onSaveGone) */
+  onSaveGone?(): Promise<void>;
+  /** the game deleted a profile's file (process.ts onRemoved) */
+  onRemoved?(path: string): void;
+  /** a save the game wrote as the browser deleted the save folder was not kept (process.ts onLost) */
+  onLost?(path: string): void;
   /** tests: where frame dumps go, and their scale */
   artifacts?: string; dumpScale?: number;
   toggleFullscreen(): void;
@@ -88,6 +104,9 @@ export class GameSession {
       cfg: { args: ['nfsu2', '/data/SPEED2.EXE'], env: o.env, dataBase: DATA_BASE, manifestUrl: MANIFEST_URL, saveDir: o.saveDir },
       onLog: (line, fd, t) => o.log(`${tid(t, fd)} ${line}`),
       onSaved: o.onSaved,
+      onSaveGone: o.onSaveGone,
+      onRemoved: o.onRemoved,
+      onLost: o.onLost,
       onNote: o.log,
     });
     s.exited = s.proc.exited.then(code => { s.exitCode = code; s.detach(); return code; });
@@ -112,8 +131,17 @@ export class GameSession {
       try {
         return await attachRenderer(s.proc, o.canvas, {
           ...common, width: o.canvas.width, height: o.canvas.height, displayHz: o.displayHz, artifacts: o.artifacts, dumpScale: o.dumpScale,
-          // a frozen picture otherwise: the game stops and the page says why
-          onLost: () => { if (!s.detached) o.onFatal(N('the graphics stopped working'), 'GPU-LOST'); },
+          // a frozen picture otherwise: the game stops and the page says why.  Some Android phones' graphics drivers
+          // (Adreno 6xx, 2026-10/11) refuse the canvas's own picture at the first frame: Chrome asks the driver whether
+          // it may import it, the driver says the format is not supported, and Dawn takes that answer for an error
+          // ("vkGetPhysicalDeviceImageFormatProperties2 failed with VK_ERROR_FORMAT_NOT_SUPPORTED - While checking
+          // external image import support with TextureFormat::RGBA8Unorm ...").  Every Play ends the same way there,
+          // so the page says so instead of "press Play again".
+          onLost: why => {
+            if (s.detached) return;
+            if (/external image import support/i.test(why) && /Android/.test(navigator.userAgent)) o.onFatal(N('the graphics stopped working'), 'GPU-ANDROID-DRIVER');
+            else o.onFatal(N('the graphics stopped working'), 'GPU-LOST');
+          },
           onMarks: o.marks,
         });
       } catch (e) { if (e instanceof OtherBuild) other = e.message; throw e; }
@@ -134,7 +162,7 @@ export class GameSession {
     })).then(i => { s.input = i; });
     if (o.netName !== null)
       void attach('network', () => attachNet(s.proc, {
-        ...common, name: o.netName!, id: o.netId, was: o.netWas, claim: o.netClaim, block: o.netBlock, notice: o.notice, lobby: o.lobby, say: o.say, back: o.netBack, queue: o.netQueue, removed: o.netRemoved,
+        ...common, name: o.netName!, id: o.netId, was: o.netWas, claim: o.netClaim, block: o.netBlock, notice: o.notice, lobby: o.lobby, say: o.say, bump: o.bump, battle: o.battle, friend: o.friend, back: o.netBack, queue: o.netQueue, removed: o.netRemoved, races: o.netRaces, rename: o.netRename,
       })).then(n => { s.net = n; });
     return s;
   }

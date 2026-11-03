@@ -29,7 +29,10 @@
  *                              only implementation: the heap track's soaks
  *                              and the LAN race scripts use it too
  *   racewin                    finish the player now (1st if nobody finished)
- *   careerlist                 log stage, bank and the available races
+ *   careerlist                 log stage, bank and the available races; the
+ *                              stage's outrun wins, the "other" events open
+ *                              (unique parts' stars, cover shoots), the map's
+ *                              markers and the other event being run
  *   fnglist [x]                log the active front-end packages (overlays too;
  *                              x: FNGInfo flags and control mask)
  *   waitfe NAME [tmo]          wait until package NAME is active (overlays too)
@@ -40,6 +43,7 @@
  *                              next = the available race the bot would pick)
  *   shopgo NAME                teleport onto a shop's marker (CC_CAR_LOT_1 ...)
  *   showgo NAME                teleport onto a cover shoot's marker (STAGE_2_DVD_1)
+ *                              or an other event's (STAGE_3_PERF_1)
  *   waitroam [tmo]             wait until the car is in free roam (2 s settled)
  *   cargo K [BEHIND]           jump behind the K-th car of the car manager
  *   outrun [K] [tmo]           challenge the free-roam tuner in racer slot K
@@ -49,8 +53,16 @@
  *   outrunwin                  win the outrun in progress (RACEWIN does too)
  *   visual                     log the car's visual rating (0x528410: with the
  *                              NFSU2_CAREER_BOT_VISUAL tweak, and its own)
+ *   uniques [won]              log the shown car's unique (level-4) visual parts
+ *                              per slot and how many the shops' check (0x52A010,
+ *                              filter 6) and the garage's (2) let through, and
+ *                              whether Caleb is beaten (uniques.c); "won" first
+ *                              adds a won record of stage 5's final event
  *   watchw X                   debug: log the guest functions that write X
  *   bot on|off                 the career bot below (also NFSU2_CAREER_BOT=1)
+ *   mpcredit NAME[,NAME] [MARGIN]  the wins of those races at the next crib, as
+ *                              multiplayer race's (mpcredit.c; MARGIN as the
+ *                              game measures it, 100 by default, -1 a friend's)
  * X/ARG/FN are expressions: numbers, "*X" (guest dword at X), "(X)", "+", "-",
  * and "*" between two operands (multiply), e.g. "*(*0x890118+0xbd0)".
  */
@@ -119,6 +131,16 @@ void autotest_tap(unsigned dik, long frames);
 #define G_NSHOWS         0x00838408u
 #define SHOW_SIZE        0x40u
 #define G_VISUAL_TWEAK   0x007fa290u
+/* "Other" events: [0x838424] x [0x838420], 0x18 bytes (+0 name, +2 its
+ * trigger's name, +4 stage, +6 what opens it: 2 the stage's outrun wins
+ * (stage record +0xDC) reaching +7; +0xC the shop or cover it leads to):
+ * the unique parts' stars (STAGE_5_VISUAL_5, the wide body kit) and the
+ * cover shoots' (STAGE_2_SHOW_1).  Career +0x7148: those open now (32),
+ * Career +0: the map's markers (64 of 0x18 bytes: +0 trigger, +4 race,
+ * +8 shop, +0xC cover, +0x10 other event), Career +0xC08: the one being
+ * run. */
+#define G_OTHERS         0x00838424u
+#define G_NOTHERS        0x00838420u
 
 /* ---- expressions ---------------------------------------------------------- */
 static const char *xp;
@@ -439,6 +461,26 @@ static void career_list(void){
         uint32_t r = MR32(G_CAREER + 0x71c8u + 4u * (uint32_t)i);
         if (r) fprintf(stderr, " %s(%s%s)", race_name(r), race_type(r), race_won(r) ? ",won" : "");
     }
+    fputc('\n', stderr);
+    /* the other events open now, the map's markers by kind (the other events
+     * and shops by name), the other event being run */
+    uint32_t st = MR32(G_CAREER + 0x7af8u), run = MR32(G_CAREER + 0xc08u), n[5] = { 0 };
+    fprintf(stderr, "[career] f=%ld stage %u: %u outrun wins, other events open:", autotest_frame(), st,
+            st < 8 ? MR32(G_CAREER + 0x72d8u + st * 0x104u + 0xdcu) : 0u);
+    for (uint32_t i = 0; i < 32u; i++){
+        uint32_t e = MR32(G_CAREER + 0x7148u + 4u * i);
+        if (e) fprintf(stderr, " %s", race_name(e));
+    }
+    fprintf(stderr, "; markers:");
+    for (uint32_t i = 0; i < 64u; i++){
+        uint32_t m = G_CAREER + 0x18u * i;
+        if (!MR32(m)) continue;
+        for (uint32_t k = 0; k < 5u; k++) if (k == 4u || MR32(m + 4u + 4u * k)){ n[k]++; break; }
+        if (MR32(m + 0x10u)) fprintf(stderr, " %s", race_name(MR32(m + 0x10u)));
+        else if (MR32(m + 8u) && run) fprintf(stderr, " shop %s", gstr(MR32(m + 8u)));
+    }
+    fprintf(stderr, " (%u races, %u shops, %u cover shoots, %u other events, %u more)", n[0], n[1], n[2], n[3], n[4]);
+    if (run) fprintf(stderr, "; running %s", race_name(run));
     fputc('\n', stderr);
 }
 /* the available race that is not won yet (of type ty, if given) that moves the
@@ -916,6 +958,53 @@ static void bot_tick(void){
     }
 }
 
+/* "uniques [won]": the shown car's unique (level-4) visual parts, slot by slot
+ * (CARSLOTID names from the table at 0x802DE8, {id, name} pairs), and how many
+ * of them 0x52A010 lets through for the shops (filter 6) and the garage (2).
+ * Parts as a shop lists them (0x539960): the first by 0x61BA30(car type, slot,
+ * 0, -1), the next by 0x61BA50(part, car type, slot, 0, -1), on the parts
+ * database 0x8A2B68; the car type from the shown car ([0x8389AC], its method
+ * +4). */
+int uniques_caleb_beaten(void);
+static void uniques_list(CPU *c, int won){
+    if (won){
+        uint32_t si = MR32(0x0086262cu), n = MR32(G_CAREER + 0x7afcu);
+        if (si && mem_is_committed(si + 0x2bu) && n < 0x181u){
+            uint32_t r = G_CAREER + 0x7b00u + 8u * n;
+            MR32(r) = MR32(si + 0x28u); MR32(r + 4u) = 0; MR8(r + 6u) = 1;
+            MR32(G_CAREER + 0x7afcu) = n + 1u;
+            fprintf(stderr, "[career] uniques: stage 5's final event 0x%08x marked won (record %u)\n", MR32(si + 0x28u), n);
+        }
+    }
+    uint32_t car = MR32(0x008389acu), ct = 0;      /* set in the front end (garage, shops), 0 in free roam */
+    if (car && mem_is_committed(car) && mem_is_committed(MR32(car) + 7u)) ct = guest_call(c, MR32(MR32(car) + 4u), car, 0, 0);
+    fprintf(stderr, "[career] f=%ld uniques: Caleb beaten %d, shown car 0x%08x, car type %u, game mode %u, garage flag %u\n",
+            autotest_frame(), uniques_caleb_beaten(), car, ct, MR32(0x00850078u), MR32(0x0083898cu));
+    if (!car || ct > 64u) return;
+    unsigned tot = 0, tshop = 0, tgar = 0, parts = 0;
+    for (uint32_t slot = 0; slot < 0x4cu; slot++){
+        uint32_t e = 0x00802de8u + 8u * slot, nm = MR32(e + 4u);
+        const char *name = MR32(e) == slot && nm >= 0x783000u && nm < 0x7e8000u ? (const char *)&MR8(nm) : "?";
+        unsigned all = 0, uniq = 0, shop = 0, gar = 0, lv[8] = {0};
+        uint32_t prev = 0, price = 0;
+        for (int k = 0; k < 4096; k++){
+            uint32_t a[4] = { ct, slot, 0, 0xffffffffu }, b[5] = { prev, ct, slot, 0, 0xffffffffu };
+            uint32_t p = prev ? guest_call(c, 0x0061ba50u, 0x008a2b68u, 5, b) : guest_call(c, 0x0061ba30u, 0x008a2b68u, 4, a);
+            if (!p || p == prev || !mem_is_committed(p + 13u)) break;
+            prev = p; all++; lv[MR8(p + 5u) >> 5]++;
+            if ((MR8(p + 5u) >> 5) != 4u) continue;
+            if (!uniq++){ uint32_t pa[2] = { slot, p }; price = guest_call(c, 0x00514280u, G_CAREER, 2, pa); }  /* a buy's price (0x5289F0) */
+            uint32_t s6[4] = { 6u, slot, p, MR32(0x008389b0u) }, s2[4] = { 2u, slot, p, MR32(0x008389b0u) };
+            if (guest_call(c, 0x0052a010u, 0, 4, s6) & 0xffu) shop++;
+            if (guest_call(c, 0x0052a010u, 0, 4, s2) & 0xffu) gar++;
+        }
+        if (uniq) fprintf(stderr, "[career] uniques: slot %u %s: %u parts (levels 0-7: %u %u %u %u %u %u %u %u), %u unique (the first $%u), %u in the shops, %u in the garage\n",
+                          slot, name, all, lv[0], lv[1], lv[2], lv[3], lv[4], lv[5], lv[6], lv[7], uniq, price, shop, gar);
+        tot += uniq; tshop += shop; tgar += gar; parts += all;
+    }
+    fprintf(stderr, "[career] uniques: %u parts, %u of them unique, %u in the shops, %u in the garage\n", parts, tot, tshop, tgar);
+}
+
 static void run_job(CPU *c, const char *line){
     char cmd[32] = {0}; int used = 0;
     sscanf(line, "%31s %n", cmd, &used);
@@ -951,7 +1040,8 @@ static void run_job(CPU *c, const char *line){
         fprintf(stderr, "[career] f=%ld visual rating %.2f (its own %.2f, tweak %.2f)\n", autotest_frame(),
                 visual_rating(0), visual_rating(1), (double)MRF32(G_VISUAL_TWEAK));
         g_cpu = 0;
-    } else if (!strcasecmp(cmd, "racewin")) race_win(c);
+    } else if (!strcasecmp(cmd, "uniques")) uniques_list(c, !strncasecmp(rest, "won", 3));
+    else if (!strcasecmp(cmd, "racewin")) race_win(c);
     else if (!strcasecmp(cmd, "outrunwin")) outrun_win();
     else if (!strcasecmp(cmd, "bot")){
         B.on = !strncasecmp(rest, "on", 2); B.phase = BOT_IDLE; B.nkeys = 0;
@@ -962,10 +1052,16 @@ static void run_job(CPU *c, const char *line){
 }
 
 /* Main-loop hook.  sub_004022c0 is an empty function with ~300 callers; only
- * the call from GameLoop (return address 0x581475) does work. */
+ * GameLoop's do work: the call returning to 0x581475 (before the camera's
+ * and the sound's update), and the first after the frame's Present
+ * (0x5D2850), which gives back the camera the right stick's look turned for
+ * the frame drawn (look.c). */
+#define LOOK_END_RET     0x005814e0u
+void look_frame_end(void);
 void sub_004022c0_orig(CPU *c);
 void sub_004022c0(CPU *c){
-    if (MR32(c->esp) == MAINLOOP_RET){
+    if (MR32(c->esp) == LOOK_END_RET) look_frame_end();
+    else if (MR32(c->esp) == MAINLOOP_RET){
         if (!g_hooked) bot_init();
         g_hooked = 1;
         while (g_qh != g_qt){ Job *j = &g_q[g_qh]; g_qh = (g_qh + 1) % QMAX; run_job(c, j->line); }
@@ -985,7 +1081,7 @@ static void queue(const char *line){
 int career_is_cmd(const char *cmd){
     static const char *const k[] = { "call", "memdump", "waitx", "teleport", "autopilot", "racewin",
                                      "careerlist", "careergo", "shopgo", "peekx", "fnglist", "bot", "waitfe", "tapfe", "waitroam", "showgo", "cargo", "watchw",
-                                     "outrun", "outrunwin", "visual", 0 };
+                                     "outrun", "outrunwin", "visual", "uniques", "mpcredit", 0 };
     for (int i = 0; k[i]; i++) if (!strcasecmp(cmd, k[i])) return 1;
     return 0;
 }
@@ -1011,7 +1107,8 @@ int career_cmd(CPU *c, const char *line, long *wait_start){
         queue(line); return 1;
     }
     if (!strcasecmp(cmd, "call") || !strcasecmp(cmd, "autopilot") || !strcasecmp(cmd, "racewin") ||
-        !strcasecmp(cmd, "bot") || !strcasecmp(cmd, "outrunwin") || !strcasecmp(cmd, "visual")){
+        !strcasecmp(cmd, "bot") || !strcasecmp(cmd, "outrunwin") || !strcasecmp(cmd, "visual") ||
+        !strcasecmp(cmd, "uniques")){
         queue(line); return 1; }
     if (!strcasecmp(cmd, "memdump")){
         uint32_t a = eval(a1), n = eval(a2);
@@ -1080,8 +1177,14 @@ int career_cmd(CPU *c, const char *line, long *wait_start){
         uint32_t t = MR32(G_SHOWS), n = MR32(G_NSHOWS), q = 0;
         for (uint32_t i = 0; t && i < n && !q; i++) if (!strcasecmp(gstr(t + i * SHOW_SIZE), a1)) q = t + i * SHOW_SIZE;
         char what[64]; snprintf(what, sizeof what, "showgo %s", a1);
-        if (!q) fprintf(stderr, "[career] f=%ld %s: no such showcase\n", f, what);
-        else goto_marker(marker_by_hash(MR32(q + 0x2cu)), what);
+        if (q){ goto_marker(marker_by_hash(MR32(q + 0x2cu)), what); return 1; }
+        /* ... or an "other" event's (STAGE_3_PERF_1: its trigger, the name at +2) */
+        t = MR32(G_OTHERS); n = MR32(G_NOTHERS);
+        for (uint32_t i = 0; t && i < n && !q; i++) if (!strcasecmp(race_name(t + i * 0x18u), a1)) q = t + i * 0x18u;
+        if (!q){ fprintf(stderr, "[career] f=%ld %s: no such showcase or other event\n", f, what); return 1; }
+        uint32_t h = 0xffffffffu;
+        for (const char *s = gstr(MR32(G_STRPOOL) + MR16(q + 2u)); *s; s++) h = h * 33u + (uint8_t)*s;   /* bStringHash */
+        goto_marker(marker_by_hash(h), what);
         return 1;
     }
     if (!strcasecmp(cmd, "cargo")){
@@ -1122,6 +1225,7 @@ int career_cmd(CPU *c, const char *line, long *wait_start){
     if (!strcasecmp(cmd, "fnglist")){
         fprintf(stderr, "[career] f=%ld fe packages:", f); fe_each(fe_print, a1[0] ? (void *)1 : 0); fputc('\n', stderr); return 1; }
     if (!strcasecmp(cmd, "careergo")){ career_go(a1); return 1; }
+    if (!strcasecmp(cmd, "mpcredit")){ int mpcredit_test(const char *, float); mpcredit_test(a1, a2[0] ? (float)atof(a2) : 100.f); return 1; }
     if (!strcasecmp(cmd, "shopgo")){
         uint32_t sh = shop_by_name(a1);
         char what[64]; snprintf(what, sizeof what, "shopgo %s", a1);

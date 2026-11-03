@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A new version on a Docker VPS (docs/web/VPS.md, /srv/nfsu2) in one command, from your own machine: the game module
+# A new version on a Docker VPS (/srv/nfsu2) in one command, from your own machine: the game module
 # of a commit, and the image of that commit (or a later one), then the server restarted and checked.
 #
 #   web/deploy/release.sh root@<vps> <folder>              the module in <folder> (nfsu2.wasm, nfsu2.json), and the
@@ -124,6 +124,15 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" \
   -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
   "https://$reg/v2/$path/manifests/sha-${commit:0:7}")
 [ "$code" = 200 ] || die "no image $img (HTTP $code): CI may have cancelled it for a newer push; pass that newer commit if it changed only the page or the server"
+
+# the start page's Changelog (CHANGELOG.md of the image's commit): its newest release should bring the module's commit,
+# else this release's changes are missing from it.  A note, not a stop; nothing when this checkout lacks the commits
+if git cat-file -e "$commit^{commit}" 2>/dev/null && git cat-file -e "$rev^{commit}" 2>/dev/null; then
+  last=$(git show "$commit:CHANGELOG.md" 2>/dev/null | sed -n 's/^## [0-9-]* (\([0-9a-f]*\))$/\1/p' | head -n 1)
+  if [ -z "$last" ] || ! git merge-base --is-ancestor "$rev" "$last" 2>/dev/null; then
+    echo "release: note: CHANGELOG.md's newest release${last:+ ($last)} comes before the module's commit $rev: the Changelog button will not list this release's changes" >&2
+  fi
+fi
 
 echo "release: module $rev ($have bytes) and image $img to $vps:$dir"
 [ $dry = 1 ] && exit 0

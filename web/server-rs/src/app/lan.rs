@@ -138,13 +138,46 @@ impl App {
             );
             bytes::Bytes::from(b.message())
         });
-        let (bans, a, k0) = (self.bans.clone(), ident.clone(), key_.clone());
+        let (bans, a, k0, days) = (self.bans.clone(), ident.clone(), key_.clone(), self.days.clone());
+        let deny = self.bans.deny();
         let on_hello: nfsu2_lan::OnHello = Box::new(move |h| {
+            let now = nfsu2_util::now_ms();
+            // a game on the switch: it played today (days.rs), by its page's own id
+            if let Some(id) = h.ids.first() {
+                days.seen(id, super::days::Seen::Play, now);
+            }
+            let mut answer = nfsu2_lan::HelloAnswer::default();
             let seen = nfsu2_bans::Seen { pages: &h.ids, owner: h.owner, addr: a.as_deref() };
-            let b = bans.by_hello(&seen, nfsu2_util::now_ms())?;
-            let line = format!("[ban] turned away a client of ban #{} \"{}\" (its page or keyphrase)", b.id, b.name);
-            log::limited("ban", "turned away", &k0, &line, 2);
-            Some(bytes::Bytes::from(b.message()))
+            let v = bans.by_hello(&seen, now);
+            // a full ban: turned away
+            if let Some(b) = v.full {
+                let line = format!("[ban] turned away a client of ban #{} \"{}\" (its page or keyphrase)", b.id, b.name);
+                log::limited("ban", "turned away", &k0, &line, 2);
+                answer.refuse = Some((bytes::Bytes::from(b.message()), nfsu2_lan::CLOSE_BANNED));
+                return answer;
+            }
+            // a name taken away (`rename`): its page asks for another, with the rename's message
+            if deny.has(h.name)
+                && let Some(d) = bans.denied_as(h.name)
+            {
+                let msg = bans.record(d.by, now).map(|r| r.ban.msg).unwrap_or_default();
+                let line = format!(
+                    "[ban] asked a client under \"{}\" for another name (\"{}\": rename #{})",
+                    js::printable(h.name, 32),
+                    d.name,
+                    d.by
+                );
+                log::limited("ban", "turned away", &k0, &line, 2);
+                answer.refuse = Some((bytes::Bytes::from(nfsu2_bans::rename_message(h.name, &msg)), nfsu2_lan::CLOSE_RENAME));
+                return answer;
+            }
+            // a race ban: it plays on, out of races
+            if let Some(b) = v.races {
+                let line = format!("[ban] a client of race ban #{} \"{}\" plays on, out of races", b.id, b.name);
+                log::limited("ban", "turned away", &k0, &line, 2);
+                answer.no_races = Some(bytes::Bytes::from(b.message()));
+            }
+            answer
         });
         // a reconnecting page says ?resume and sends its old address with the token in its first message (nfsu2-lan);
         // the group and site ids stand for the client's address without naming it (the shared limits)
@@ -165,6 +198,9 @@ impl App {
             })),
             ident,
             refuse,
+            // the client's country as Cloudflare names it (a trusted proxy's CF-IPCountry): the 5-minute counts of the
+            // paths' round trips by country (nfsu2-lan paths.rs), nothing else
+            country: nfsu2_headers::client_country(&q, &self.o.trust),
             on_hello: Some(on_hello),
             // the keyphrase the page plays with, for the claimed names (names.rs): its owner, never the token
             on_claim: self.names.as_ref().map(|_| Box::new(nfsu2_claims::owner_of_token) as nfsu2_lan::OnClaim),
@@ -210,6 +246,38 @@ mod tests {
         let (mut server, _) = l.accept().await.unwrap();
         assert!(handshake(&mut server, b"HTTP/1.1 101 Switching Protocols\r\n\r\n", Duration::from_millis(300)).await);
         drop(client);
+    }
+
+    // Pages through a proxy on this machine (trusted) that names each one's country (Cloudflare's CF-IPCountry): their
+    // round trips count under it in the 5-minute lines (nfsu2-lan paths.rs), one named "XX" (no country known) as unknown
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_counts_under_its_country() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let kit = super::super::testkit::Kit::start(&[], |_| {}).await;
+        let mut pages = Vec::new();
+        for cc in ["DE", "XX"] {
+            let s = tokio::net::TcpStream::connect(kit.addr).await.unwrap();
+            let mut q = "ws://localhost/lan".into_client_request().unwrap();
+            q.headers_mut().insert("cf-ipcountry", cc.parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::client_async(q, s).await.expect("the handshake");
+            // read on: a ping is answered as it is read
+            pages.push(tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} }));
+        }
+        // the switch's pings (a page not in free roam is timed every tenth probe)
+        let t0 = std::time::Instant::now();
+        loop {
+            kit.app.lan.probe();
+            let l = kit.app.lan.paths().await;
+            if l.first().is_some_and(|l| l.contains("all 2 ") && l.contains("; DE 1 ") && l.contains("; unknown 1 ")) {
+                assert!(l[1].starts_with("round trips to the server by region: Western Europe 1 "), "{l:?}");
+                assert!(l[1].ends_with(&format!("; unknown {}", l[0].rsplit("; unknown ").next().unwrap())), "{l:?}");
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "{l:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        pages.iter().for_each(|p| p.abort());
     }
 
     #[test]

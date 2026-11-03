@@ -67,7 +67,17 @@
                                    the game, its state as a JSON object ("{}": none), sent when it changes
                                    (roam_game.c mp_panel) */
 #define NET_KIND_SAY      18u   /* TX ring only, never on the switch: quick chat, a phrase said (by a friend near,
-                                   one in our race lobby, or the player), as a JSON object (roam_game.c say_*) */
+                                   one in our race lobby, or the player), as a JSON object (roam_game.c say_*);
+                                   in the LAN mailbox, one said in a race between players (racehorn.c qc_*) */
+#define NET_KIND_FRIEND   19u   /* TX ring only, never on the switch: the player's car and a friend's touched front
+                                   bumpers for 3 s, or parted after that, as a JSON object {"id","name","on"}
+                                   (roam_game.c bump_*): the page's "Add friend" */
+#define NET_KIND_FLYING   20u   /* TX ring only, never on the switch: the player's car flew in free roam for minutes,
+                                   as a JSON object {"s"} (the seconds; roam_game.c fly_frame): the page takes the
+                                   player off the switch, as an operator's kick does, and tells the server */
+#define NET_KIND_BATTLE   21u   /* TX ring only, never on the switch: a drift battle's scoreboard while it counts, as a
+                                   JSON object {"t","me","a","vs","b"} (seconds left, our name and points, the other
+                                   player's; roam_game.c db_panel), "{}" when there is none (drift.ts) */
 #define NET_BROADCAST      0xFFFFFFFFu
 #define NET_ROAM_HUB       0x0A4D00FDu  /* 10.77.0.253: the server's free-roam hub (web/server-rs/crates/roam),
                                    an address the switch never hands out */
@@ -100,11 +110,9 @@
 #define NET_PAGE_IDLE        4u /* no mailbox wants the switch (want 0 for a while): the page let it go, so
                                    the place is free for another player; it connects again on want */
 
-/* caps (C): what the module takes from the page while it runs, besides what every module of this version takes */
-#define NET_CAP_ROOM         1u /* room_gen and room_name: free roam's room, changed while the game runs */
-
 /* peer_bits: one bit per host of the switch's network (at most a /21) */
 #define NET_PEER_BITS     2048u
+#define NET_UDP_PORTS_SET 0x80000000u   /* udp_ports: this module says which ports have a socket */
 
 typedef struct {
     /* fixed, written by C before it registers the mailbox */
@@ -112,24 +120,33 @@ typedef struct {
     uint32_t tx_slots, rx_slots, tx_off, rx_off;               /*  16: offsets from the mailbox */
     /* C -> page */
     uint32_t mode, port, tx_head, tx_bell;                     /*  32 */
-    uint32_t rx_tail, c_alive, want, caps;                     /*  48: c_alive: +1 per network-thread loop;
+    uint32_t rx_tail, c_alive, want, udp_ports;                /*  48: c_alive: +1 per network-thread loop;
                                                                   want: this endpoint needs the switch now
                                                                   (free roam: while it runs; LAN play: from
                                                                   the game's WSAStartup to its last
                                                                   WSACleanup), C rings tx_bell on a change;
-                                                                  caps: what this module takes from the page
-                                                                  (NET_CAP_*; 0 in a module of before) */
+                                                                  udp_ports (LAN play): NET_UDP_PORTS_SET and
+                                                                  bit port % 31 of each port a UDP socket is
+                                                                  bound to, so the switch sends a LAN broadcast
+                                                                  only where a socket takes it (0: not said, an
+                                                                  older module: every broadcast), C rings
+                                                                  tx_bell on a change */
     /* page -> C */
     uint32_t page_state, vip, netmask, generation;             /*  64: generation: +1 per switch connection */
     uint32_t tx_tail, rx_head, rx_bell, rx_full_drop;          /*  80 */
     uint32_t tx_offline_drop, rx_oversize, switch_peers, solid;       /*  96: solid: free roam's solid cars as the
                                                                   page's menu switched them (0 not switched,
-                                                                  1 off, 2 on; roam_plat_solid) */
+                                                                  1 off, 2 on, 3 off with traffic and tuners
+                                                                  passing through too: Ghost mode Everything,
+                                                                  which an older module takes as not switched;
+                                                                  roam_plat_solid) */
     double   switch_rtt_ms;                                    /* 112: last ping to the switch */
     double   tx_wait_ms_sum, tx_wait_ms_max;                   /* 120: C queued -> page sent */
     uint32_t tx_wait_n, say;                                   /* 136: say: quick chat, the phrase the player
                                                                   picked (bits 0-7) and a count (bits 8-31) that
-                                                                  changes with each pick (roam_plat_say_pick) */
+                                                                  changes with each pick (roam_plat_say_pick; in
+                                                                  the LAN mailbox in a race between players,
+                                                                  vlan_rt_say_pick) */
     uint32_t peer_bits[NET_PEER_BITS / 32];                    /* 144: page: bit h set = the host h of our
                                                                   network (vip & ~netmask) is on the switch (us too) */
     uint32_t crews_gen, crews[4], crews_rgb[4];                /* 400: page: free roam's crews as the page's menu
@@ -142,7 +159,7 @@ typedef struct {
                                                                   it (an invite link), its name in UTF-8 ending in
                                                                   a 0 byte (none: no room), the words little-endian;
                                                                   room_gen +1 a change (0: not changed), written
-                                                                  after the name (roam_plat_room; NET_CAP_ROOM) */
+                                                                  after the name (roam_plat_room) */
     uint32_t pad[2];                                           /* 504 .. 511 */
 } net_mailbox;
 
@@ -167,7 +184,6 @@ _Static_assert(offsetof(net_mailbox, tx_wait_n) == 136, "tx_wait_n");
 _Static_assert(offsetof(net_mailbox, peer_bits) == 144, "peer_bits");
 _Static_assert(offsetof(net_mailbox, crews_gen) == 400, "crews_gen");
 _Static_assert(offsetof(net_mailbox, crews_rgb) == 420, "crews_rgb");
-_Static_assert(offsetof(net_mailbox, caps) == 60, "caps");
 _Static_assert(offsetof(net_mailbox, room_gen) == 436, "room_gen");
 _Static_assert(offsetof(net_mailbox, room_name) == 440, "room_name");
 _Static_assert(offsetof(net_slot, src_port) == 16, "src_port");

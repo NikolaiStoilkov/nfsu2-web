@@ -1,7 +1,9 @@
 //! The server's stand-in for EA's online servers of NFS Underground 2, for the game's own Online mode (main menu,
 //! Online) between browsers on this server.  It keeps the rules and the console lines of the Node server it
-//! replaced, and its two files in the state folder (online/stats.json, online/buddies.json) byte for byte as that one
-//! wrote them, so the results and friends lists kept before are read as they are.
+//! replaced, and its results in the state folder (online/stats.json) byte for byte as that one wrote them, so the
+//! results kept before are read as they are; the friends lists, one buddies.json then, are one file a persona since
+//! 2026-10-31 (online/friends/, buddy.rs), and free roam's pages befriend and message through them too
+//! ([`OnlineHost::friends`]; a message for a page goes out through [`OnlineHost::page_mail`]).
 //!
 //! - browser: lifted DirtySock -> winsock.c (pcnfs05.ea.com = 10.77.0.1) -> runtime/web/net_lan.c -> page -> /lan
 //!   WebSocket -> the switch (nfsu2-lan)
@@ -61,6 +63,7 @@ use nfsu2_util::{FrameCtx, Host, SwitchSend, Tap, mono_ms, now_ms};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
+pub use crate::buddy::{FriendAsk, FriendReply, FriendRow, PAGE_MSG_LEN, PageMail, PageMailHook};
 pub use crate::trace::LobbyTrace;
 
 /// 10.77.0.1: the server's own host on the virtual LAN, the address the switch never hands to a browser (vhost.rs)
@@ -98,6 +101,8 @@ pub struct OnlineOptions {
     /// the claimed names (nfsu2-claims): who may play under a name, and whose EA Messenger lists are kept; None: every
     /// name is anyone's, and every list is kept (as before names could be claimed)
     pub claims: Option<Arc<nfsu2_claims::Claims>>,
+    /// the names the operator took away (nfsu2-bans `rename`): no login or persona under one; None: none
+    pub deny: Option<Arc<nfsu2_names::Deny>>,
 }
 
 enum Event {
@@ -106,6 +111,8 @@ enum Event {
     Info(oneshot::Sender<serde_json::Value>),
     Vips(oneshot::Sender<HashSet<u32>>),
     Attach(SwitchSend),
+    Friends(Arc<str>, Arc<str>, FriendAsk, oneshot::Sender<FriendReply>),
+    PageMail(PageMailHook),
     Stop,
 }
 
@@ -126,6 +133,17 @@ impl OnlineHost {
     pub fn attach_switch(&self, send: SwitchSend) {
         let _ = self.tx.send(Event::Attach(send));
     }
+    /// where a friend's message goes when its persona is not in EA Messenger (buddy.rs `PageMailHook`: its pages)
+    pub fn page_mail(&self, f: PageMailHook) {
+        let _ = self.tx.send(Event::PageMail(f));
+    }
+    /// a page's friends lists (EA Messenger's, buddy.rs): as the keyphrase `owner` (nfsu2-claims; its claimed name is
+    /// the persona), on behalf of client `group`
+    pub fn friends(&self, owner: Arc<str>, group: Arc<str>, ask: FriendAsk) -> oneshot::Receiver<FriendReply> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(Event::Friends(owner, group, ask, tx));
+        rx
+    }
 }
 
 fn run(o: OnlineOptions, rx: mpsc::Receiver<Event>) {
@@ -135,6 +153,7 @@ fn run(o: OnlineOptions, rx: mpsc::Receiver<Event>) {
         log: Rc::new(move |line: &str, key: Option<&str>| log(line, key)),
         tap: o.tap,
         claims: o.claims,
+        deny: o.deny,
         clocks: Rc::new(Clocks { now: Box::new(|| now_ms() as f64), timer: Box::new(mono_ms) }),
         limits: Default::default(),
         buddy_limits: Default::default(),
@@ -167,6 +186,12 @@ fn run(o: OnlineOptions, rx: mpsc::Receiver<Event>) {
                 let _ = tx.send(core.vips());
             }
             Some(Event::Attach(send)) => core.attach(send),
+            Some(Event::Friends(owner, group, ask, tx)) => {
+                let mut out = None;
+                guarded(&mut core, None, |c| out = Some(c.friends(&owner, &group, ask)));
+                let _ = tx.send(out.unwrap_or_default());
+            }
+            Some(Event::PageMail(f)) => core.set_page_mail(f),
             Some(Event::Stop) => {
                 guarded(&mut core, None, |c| c.stop());
                 return;

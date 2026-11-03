@@ -10,7 +10,6 @@
 //   touch first: the primary pointer is a finger (phones, tablets), not a
 //                laptop whose screen also takes touch.
 // The Controls sheet and the hints follow touch first (html[data-touch]).
-
 export function isPhone(): boolean {
   const uad = (navigator as unknown as { userAgentData?: { mobile?: boolean } }).userAgentData;
   return uad?.mobile === true || /Android.+Mobile|iPhone|iPod/.test(navigator.userAgent) || phoneScreen(navigator.maxTouchPoints);
@@ -28,11 +27,15 @@ export function touchFirst(): boolean { return matchMedia('(pointer: coarse)').m
  *  or 100% once the render check found room to spare on this one (rendercheck.ts), full screen (no browser bars
  *  over the game), and the game's 4:3 HUD: on a phone's long screen the wide one puts the minimap under the touch
  *  controls' steering and the speedometer under Brake, the 4:3 one between the thumbs.  Players' cars shown in free
- *  roam: 16 on phones, 24 on tablets, 32 elsewhere (an iPhone was stopped for memory as 22 friends' cars loaded at
- *  once at the new career's start, 2026-10-25). */
+ *  roam: 16 on phones, 24 on tablets (an iPhone was stopped for memory as 22 friends' cars loaded at once at the new
+ *  career's start, 2026-10-25), the file's 32 on computers.  40 and 48 only when the player picks them: each car past
+ *  32 costs the game's thread about 0.28 ms a frame on a Ryzen 5900X (14 -> 18.5 ms with 48 in view), a laptop's
+ *  several times that, and the game's own drop back to 32 (roam_game.c cars_cut) waits for frames under ~40 fps: it
+ *  never helps a player who went from 144 to 100 fps (fast computers started at 48, then 40, until 2026-11-02). */
 export function deviceDefaults(): Record<string, string> {
   if (isPhone()) return { render: rememberedRender() === 'backing' ? 'backing' : 'scale:0.75', fullscreen: 'on', hud: '43', roam_max_cars: '16' };
-  return touchFirst() ? { roam_max_cars: '24' } : {};
+  if (touchFirst()) return { roam_max_cars: '24' };
+  return {};
 }
 
 /** the render check's verdict on this phone: in this browser only, like the other device defaults (settings.ini,

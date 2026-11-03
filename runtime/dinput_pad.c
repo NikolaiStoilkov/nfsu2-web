@@ -399,6 +399,9 @@ static int chan_reads_axis(uint32_t ch, uint32_t ofs){
     if (MR8(ch + 0x368u) && MR8(ch + 0x367u)) return MR32(ch + 0x350u) == ofs;
     return (MR8(ch + 0x365u) && MR32(ch + 0x348u) == ofs) || (MR8(ch + 0x366u) && MR32(ch + 0x34cu) == ofs);
 }
+#define ACT_LOOK_BACK   0x09u            /* the game's action id (its keyboard map 0x7fcac0: "Look Back") */
+static int g_look_back_bound;            /* the pad last read has a button on it */
+int look_back_held(const PadState *s);   /* look.c */
 static void fill_state(uint8_t *buf, uint32_t size, Dev *d, const PadState *s){
     uint8_t st[0x110];
     memset(st, 0, sizeof st);
@@ -409,7 +412,8 @@ static void fill_state(uint8_t *buf, uint32_t size, Dev *d, const PadState *s){
         int32_t v = scale_axis(t, d, a);
         memcpy(st + k_axis_ofs[a], &v, 4);
     }
-    uint32_t b = s->buttons;
+    uint32_t showoff_pad(uint32_t b);                  /* showoff.c: D-pad down held while the car stands */
+    uint32_t b = showoff_pad(s->buttons);
     uint32_t pov[4] = { pov_of(!!(b & 1u << PAD_DUP), !!(b & 1u << PAD_DDOWN),
                                !!(b & 1u << PAD_DLEFT), !!(b & 1u << PAD_DRIGHT)),
                         stick_pov(d, s->axis[PAD_AXIS_LX], s->axis[PAD_AXIS_LY]),
@@ -438,8 +442,16 @@ static void fill_state(uint8_t *buf, uint32_t size, Dev *d, const PadState *s){
         int on = src == SRC_LT_FULL ? d->trig[0] : src == SRC_RT_FULL ? d->trig[1] : !!(b & (1u << src));
         if (on) st[0x30 + i] = 0x80;
     }
+    /* the right stick straight back while driving holds the button the player has on Look Back (look.c): the
+     * channel's in-game table (+0x18, by button) gives it */
+    int lb = -1;
+    for (int i = 0; ch && i < NBTNS && lb < 0; i++) if (MR32(ch + 0x018u + 4u * (uint32_t)i) == ACT_LOOK_BACK) lb = i;
+    g_look_back_bound = lb >= 0;
+    if (lb >= 0 && look_back_held(s)) st[0x30 + lb] = 0x80;
     memcpy(buf, st, size < sizeof st ? size : sizeof st);
 }
+/* look.c: whether the pad has a button on Look Back (else the stick turns the view round to the rear) */
+int pad_look_back_bound(void){ return g_look_back_bound; }
 
 /* ---- front-end keystrokes ----------------------------------------------------------
  * Some front-end input exists only as characters from the window procedure
@@ -532,6 +544,60 @@ static void apply_profile(uint32_t ch, int wheel){
     MR8(ch + 0x367) = 0; MR8(ch + 0x368) = 0;
     if (pad_log()) fprintf(stderr, "[pad] default %s layout applied to input channel 0x%08x\n", wheel ? "wheel" : "pad", ch);
 }
+
+/* ---- the bindings over an unplug -------------------------------------------------
+ * The player's bindings live in the device's input channel: the in-game
+ * table (+0x18, 32 actions) and the analog ones (+0x344 .. +0x368), what
+ * the profile saves per guidInstance (0x5b9420) and gives back when it loads
+ * (0x5b9570), and nothing else.  When the game lets a device go (DIERR_INPUTLOST,
+ * 0x5c883f clears its slot [0x86ffb4 + 4 slot]), the next frame frees its
+ * channel (0x5c0f90: +0x230 = -1), and a device made later takes a free
+ * channel with the defaults (0x5ca690 -> 0x5c14f0 -> 0x5c11a0 -> the lookup
+ * below): in hotplug mode a controller unplugged and plugged in again (an
+ * Xbox pad that switches itself off when left alone, and on again) came back
+ * with the default layout until the profile was loaded again, a restart (a
+ * player's report: Shift Up on RB and Down on LB, back on A and X).  So the
+ * bindings of a pad (or wheel) unplugged are kept as the game lets it go,
+ * and the next device of its kind the game sets up gets them back, once:
+ * the Controls page's reset to default still resets.  A device let go for a
+ * controller of the other kind keeps the old way (its successor gets the
+ * defaults of its own kind). */
+#define G_DEVSLOT       0x0086ffb4u      /* the game's 2 device slots */
+#define G_CHANNELS      0x00874c40u      /* its 6 input channels, CH_SIZE each */
+#define CH_SIZE         0x370u
+#define CH_SLOT         0x230u           /* the device slot it reads (-1 free) */
+#define CH_TYPE         0x234u           /* 0x14 joystick, 0x15 gamepad, 0x16 driving (0x5c14f0) */
+#define CH_GAME         0x018u
+#define CH_GAME_N       0x80u
+#define CH_AXES         0x344u
+#define CH_AXES_N       0x25u
+static struct { int have; uint8_t game[CH_GAME_N], axes[CH_AXES_N]; } g_kept[2];   /* [0] the pad, [1] the wheel */
+static uint32_t channel_of(uint32_t obj){
+    for (uint32_t i = 0; i < 2u; i++){
+        if (MR32(G_DEVSLOT + 4u * i) != obj) continue;
+        for (uint32_t n = 0; n < 6u; n++){
+            uint32_t ch = G_CHANNELS + CH_SIZE * n, t = MR32(ch + CH_TYPE);
+            if (MR32(ch + CH_SLOT) == i && t >= 0x14u && t <= 0x16u) return ch;
+        }
+    }
+    return 0;
+}
+static void keep_bindings(uint32_t obj, int wheel){
+    uint32_t ch = channel_of(obj);
+    if (!ch) return;
+    memcpy(g_kept[wheel].game, g_mem + ch + CH_GAME, CH_GAME_N);
+    memcpy(g_kept[wheel].axes, g_mem + ch + CH_AXES, CH_AXES_N);
+    g_kept[wheel].have = 1;
+    fprintf(stderr, "[pad] the %s is unplugged: its bindings are kept for when it is back\n", wheel ? "wheel" : "pad");
+}
+static void bindings_back(uint32_t ch, int wheel){
+    if (!g_kept[wheel].have) return;
+    g_kept[wheel].have = 0;
+    memcpy(g_mem + ch + CH_GAME, g_kept[wheel].game, CH_GAME_N);
+    memcpy(g_mem + ch + CH_AXES, g_kept[wheel].axes, CH_AXES_N);
+    fprintf(stderr, "[pad] the %s is back: its bindings from before the unplug (input channel 0x%08x)\n", wheel ? "wheel" : "pad", ch);
+}
+
 /* 0x5b81b0(devinfo, tableA, tableB): the game's built-in profile lookup,
  * called from the channel set-up 0x5c11a0 (device attach, and "reset to
  * default" in the controls screen).  cdecl, returns al = 1 when found. */
@@ -541,6 +607,7 @@ void sub_005b81b0(CPU *c){
     int ours = pad_mode() != MODE_OFF && ddi ? dipad_guid(ddi + 4u) : 0;
     if (ours && ta > 0x18u){
         apply_profile(ta - 0x18u, ours == 2);
+        bindings_back(ta - 0x18u, ours == 2);
         c->eax = (c->eax & 0xFFFFFF00u) | 1u;
         POP32(c->eip);
         return;
@@ -981,6 +1048,7 @@ uint32_t dipad_call(CPU *c, uint32_t self, const char *nm, int nargs, const uint
                 fprintf(stderr, "[pad] %s drives the pad: the game's %s device makes way for a %s\n",
                         s.name, d->wheel ? "wheel" : "pad", s.wheel ? "wheel" : "pad");
             }
+            else if (!d->gone) keep_bindings(self, d->wheel);     /* unplugged: the next one of its kind gets them */
             d->gone = 1;
             return DIERR_INPUTLOST;
         }
@@ -1133,4 +1201,94 @@ void sub_00407750(CPU *c){
         if (pad_log()) fprintf(stderr, "[pad] player input controller at 0x%08x\n", ctx);
     }
     sub_00407750_orig(c);
+}
+
+/* ---- the keyboard's steering next to a wheel ----------------------------------
+ * 0x5c1000 (cdecl: port) tells whether the port's device is a driving device;
+ * the driver's update (0x41dfc0, the call returning to 0x41dfea) then steers
+ * with 0x4061c0, the steering straight to the car's angle, instead of
+ * 0x416bb0, which turns the wheels towards it at a rate and a lock that fall
+ * with the speed.  The game asks the port, not where the steering came from,
+ * and the keyboard's steering is the same event as the wheel's (0x407750: a
+ * key gives 0x00 or 0xFF), so with a wheel connected, resting or not, a key
+ * steered to full lock in the first frame at any speed (a player's report:
+ * "the car can now steer to full lock at speed").  So for the driver's update
+ * the wheel is a driving device only while it is turned from the centre;
+ * resting, the keyboard (or nothing) steers as without a wheel.  ZF as the
+ * game's own answer leaves it: the caller tests it.
+ * tests/scripts/kb_steer_wheel.txt. */
+#define WHEEL_STEERS 0.02f               /* |LX| from which the wheel is turned */
+void sub_005c1000_orig(CPU *c);
+void sub_005c1000(CPU *c){
+    uint32_t ret = MR32(c->esp);
+    sub_005c1000_orig(c);
+    if (ret != 0x0041dfeau || !(c->eax & 0xffu)) return;
+    PadState s; gamepad_read(&s);
+    if (s.connected && s.wheel && fabsf(s.axis[PAD_AXIS_LX]) >= WHEEL_STEERS) return;
+    c->eax &= ~0xffu;
+    c->zf = 1;
+}
+
+/* ---- the right stick turns the car in the garage and the shops ----------------
+ * The front end's car viewer (the garage, the shops, the car lots) runs its
+ * frame from its message handler (0x4d8d20, message 0xc98356ba): the update
+ * (0x4d82d0), then the mouse (0x4a5d90, thiscall: the viewer).  While the
+ * middle button is held (the mouse at 0x8763d0: +0x27 down, +0x29 let go this
+ * frame) the drag sets the viewer's turn speed +0x248 = dx / 2 and its tilt
+ * speed +0x24c = dy / 2, and stops the showcase that turns the car once
+ * nothing was pressed for a while ([0x8363fc] = 0, its idle clock [0x837aa0]
+ * = the game's time [0x8651ac]).  Letting go sets both back to 0, and so does
+ * a GenericDialog.fng over the viewer.  The next update turns the car by
+ * +0x248 x dt x 60 degrees (+0x274) and moves its camera up or down by
+ * 0.1 x +0x24c x dt x 60 (0x44ce00: camera +0x144, through 0x4454e0; from
+ * 1.2 to 5.2).  The consoles' right stick sets the same two, -1 to 1
+ * (0x4a5740: actions 0x42 to 0x47), which no binding of the PC's front-end
+ * pad table reaches.  So here, after the game's own and unless the middle
+ * button is held, the controller's right stick out of its dead zone
+ * (gamepad_read) sets them at the consoles' scale: full stick turns the car 60
+ * degrees a second, about a fast drag.  Stick right turns the view right, as
+ * photo mode's right stick turns its orbit camera (photo.c) and as a drag to
+ * the right turns it here: the car's near side moves right, the garage behind
+ * it left.  (The consoles' axis, 0x44, turns it the other way.)  Stick down
+ * looks further down at the car: the camera
+ * rises, as photo mode's and a drag down here do.  Back at rest both go to 0
+ * once.  A wheel's and an RC radio's right stick is always at rest
+ * (web/src/input/wheel.ts).  The angle starts over on every screen, as the
+ * game has it. */
+#define VW_CAMERA    0x23cu        /* the viewer's camera (+0xa8 its height) */
+#define VW_TURN      0x248u        /* float: the viewer's turn speed (60 degrees a second at 1) */
+#define VW_TILT      0x24cu        /* float: its camera's tilt speed */
+#define VW_ANGLE     0x274u        /* float: the car's angle, degrees */
+#define CAM_HEIGHT   0xa8u
+#define G_FE_BUSY    0x00838578u   /* the front end takes no input now (0x510c30) */
+#define G_MOUSE_MID  0x008763f7u   /* byte: the mouse's middle button is down */
+#define G_SHOWCASE   0x008363fcu   /* byte: the showcase turns the car */
+#define G_VIEW_IDLE  0x00837aa0u   /* when the viewer was last turned (the showcase starts a while after) */
+#define G_FE_TIME    0x008651acu   /* the game's time */
+int career_fe_active(const char *name);
+void sub_004a5d90_orig(CPU *c);
+void sub_004a5d90(CPU *c){
+    static uint32_t turning;       /* the viewer the stick turns, 0 none */
+    uint32_t v = c->ecx;
+    sub_004a5d90_orig(c);
+    if (MR8(G_MOUSE_MID)){ turning = 0; return; }             /* the drag's */
+    PadState s;
+    float x = 0.f, y = 0.f;
+    if (pad_mode() != MODE_OFF && gamepad_read(&s) && !s.wheel){ x = s.axis[PAD_AXIS_RX]; y = s.axis[PAD_AXIS_RY]; }
+    if ((x == 0.f && y == 0.f) || MR32(G_FE_BUSY) || career_fe_active("GenericDialog.fng")){
+        if (turning == v){
+            MRF32(v + VW_TURN) = 0.f; MRF32(v + VW_TILT) = 0.f;
+            uint32_t cam = MR32(v + VW_CAMERA);
+            if (pad_log()) fprintf(stderr, "[pad] the right stick let go: the car at %.0f degrees, the camera at %.2f\n",
+                                   MRF32(v + VW_ANGLE), cam && mem_is_committed(cam + CAM_HEIGHT + 3u) ? MRF32(cam + CAM_HEIGHT) : -1.f);
+        }
+        turning = 0;
+        return;
+    }
+    MRF32(v + VW_TURN) = x;
+    MRF32(v + VW_TILT) = y;
+    MR8(G_SHOWCASE) = 0;
+    MR32(G_VIEW_IDLE) = MR32(G_FE_TIME);
+    if (!turning && pad_log()) fprintf(stderr, "[pad] the right stick turns the car (viewer 0x%08x, the car at %.0f degrees)\n", v, MRF32(v + VW_ANGLE));
+    turning = v;
 }
